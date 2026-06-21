@@ -1,0 +1,34 @@
+{
+  "name": "todays-focus",
+  "version": "2.0.0",
+  "description": "A minimalist, multi-user productivity app — collect many thoughts, projects and goals, but commit to only ONE focus for the day.",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "build:css": "tailwindcss -i ./src/tailwind.css -o ./public/tailwind.css --minify",
+    "watch:css": "tailwindcss -i ./src/tailwind.css -o ./public/tailwind.css --watch"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "keywords": [
+    "productivity",
+    "focus",
+    "minimalist",
+    "self-hosted",
+    "multi-user",
+    "sqlite"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "tailwindcss": "^3.4.17"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "cookie-parser": "^1.4.7",
+    "express": "^4.19.2",
+    "jsonwebtoken": "^9.0.2"
+  }
+}

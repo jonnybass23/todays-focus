@@ -1,0 +1,41 @@
+# Today's Focus — self-hosted multi-user stack (Unraid-friendly).
+#   docker compose up -d --build
+#
+# Put this behind your reverse proxy (Nginx Proxy Manager / SWAG / Cloudflare)
+# so it is served over HTTPS on your domain. The app trusts the proxy and will
+# then issue Secure cookies automatically.
+services:
+  todays-focus:
+    build: .
+    image: todays-focus:latest
+    container_name: todays-focus
+    restart: unless-stopped
+    ports:
+      - "${PORT:-3000}:3000"
+    environment:
+      - PORT=3000
+      - DATA_DIR=/app/data
+      # Your timezone — controls when "today" rolls over for focus streaks.
+      - TZ=${TZ:-UTC}
+
+      # --- SECURITY: set a long random secret so logins survive restarts/redeploys ---
+      # Generate one:  openssl rand -hex 48
+      - JWT_SECRET=${JWT_SECRET:-please-change-me-to-a-long-random-string}
+
+      # Number of proxies in front of the app (1 for a single reverse proxy).
+      - TRUST_PROXY=1
+
+      # --- REGISTRATION ---
+      # Share this code with friends/family so they can self-register.
+      # Leave blank to disable invite-code signup entirely.
+      - INVITE_CODE=${INVITE_CODE:-change-this-invite-code}
+      # Set to "true" to let ANYONE register (toggleable later in the Admin panel).
+      - OPEN_REGISTRATION=false
+
+      # --- OPTIONAL: pre-create the admin account on first boot ---
+      # If you skip these, the FIRST account created via the UI becomes the admin.
+      # - ADMIN_USERNAME=admin
+      # - ADMIN_PASSWORD=change-this-strong-password
+    volumes:
+      # The SQLite database + secret live here on the host — back this folder up.
+      - ./data:/app/data

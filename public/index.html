@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#09090b" />
+  <title>Today's Focus</title>
+
+  <!-- PWA / installable -->
+  <link rel="manifest" href="/manifest.webmanifest" />
+  <link rel="icon" href="/icon-192.png" />
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-title" content="Focus" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+
+  <!-- No-flash: apply the saved theme before first paint -->
+  <script>
+    (function () {
+      try { var t = localStorage.getItem('tf-theme'); if (t) document.documentElement.setAttribute('data-theme', t); } catch (e) {}
+    })();
+  </script>
+
+  <link rel="stylesheet" href="/tailwind.css" />
+
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet" />
+
+  <style>
+    /* ============================================================
+       THEME PALETTES — tweak the three colour schemes here.
+       ============================================================ */
+    :root, html[data-theme="dark"] {
+      --bg:#09090b; --panel:#141416; --card:#1d1d21; --edge:#27272a; --edge-strong:#52525b;
+      --ink:#f4f4f5; --ink-soft:#a1a1aa; --ink-faint:#52525b; --ink-strong:#ffffff;
+      --accent:#fbbf24; --input:#0c0c0e;
+      --focus-tint:rgba(255,255,255,0.025); --panel-shadow:0 0 0 0 transparent; --bg-grad:none;
+    }
+    html[data-theme="light"] {
+      --bg:#eeeeef; --panel:#ffffff; --card:#ffffff; --edge:#e2e2e5; --edge-strong:#b1b1b8;
+      --ink:#1b1b1f; --ink-soft:#57575f; --ink-faint:#a4a4ac; --ink-strong:#0a0a0b;
+      --accent:#d97706; --input:#ffffff;
+      --focus-tint:rgba(0,0,0,0.015); --panel-shadow:0 1px 3px rgba(20,20,30,0.07); --bg-grad:none;
+    }
+    html[data-theme="cardboard"] {
+      --bg:#c9b18b; --panel:#d7c3a0; --card:#e4d5ba; --edge:#a98a5e; --edge-strong:#7d6240;
+      --ink:#3b2d1a; --ink-soft:#6a543a; --ink-faint:#9a7e57; --ink-strong:#231a0d;
+      --accent:#9a4a0a; --input:#e9dcc3;
+      --focus-tint:rgba(70,45,15,0.05); --panel-shadow:0 1px 2px rgba(60,40,20,0.18);
+      --bg-grad:repeating-linear-gradient(90deg, rgba(110,75,35,0.045) 0 1px, transparent 1px 6px);
+    }
+
+    html, body { height:100%; }
+    body { background-color: var(--bg); background-image: var(--bg-grad, none); transition: background-color .25s ease, color .25s ease; }
+    ::selection { background: rgba(245,158,11,0.28); }
+
+    #focus-zone {
+      border:2px solid var(--edge); border-radius:1.5rem;
+      background: radial-gradient(120% 120% at 50% 0%, var(--focus-tint), transparent 60%);
+      transition: border-color .25s ease, box-shadow .25s ease, background .25s ease;
+    }
+    #focus-zone.is-active { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent), 0 0 70px -22px var(--accent); }
+    #focus-zone.drag-over { border-color: var(--accent); box-shadow: inset 0 0 0 2px var(--accent), 0 0 70px -12px var(--accent); }
+    html[data-theme="cardboard"] #focus-zone.is-active { background: radial-gradient(120% 120% at 50% 0%, rgba(255,220,140,0.22), transparent 60%), rgba(235,218,190,0.50); box-shadow: inset 0 0 0 1px var(--accent), inset 0 0 50px -10px rgba(255,200,80,0.18), 0 0 65px -2px rgba(255,200,80,0.52); }
+    html[data-theme="cardboard"] #focus-zone.drag-over  { background: radial-gradient(120% 120% at 50% 0%, rgba(255,220,140,0.28), transparent 60%), rgba(235,218,190,0.60); box-shadow: inset 0 0 0 2px var(--accent), inset 0 0 50px -10px rgba(255,200,80,0.22), 0 0 65px -2px rgba(255,200,80,0.65); }
+
+    [data-dropzone].drag-over { outline:2px dashed var(--edge-strong); outline-offset:-4px; border-radius:.75rem; }
+    .themed-shadow { box-shadow: var(--panel-shadow); }
+    .dragging { opacity:.4; }
+    .card-enter { animation: cardpop .18s ease-out; }
+    @keyframes cardpop { from { opacity:0; transform: translateY(4px) scale(.985); } to { opacity:1; transform:none; } }
+    .modal-backdrop { background: rgba(0,0,0,0.55); backdrop-filter: blur(2px); }
+
+    .clean-scroll::-webkit-scrollbar { width:8px; }
+    .clean-scroll::-webkit-scrollbar-thumb { background: var(--edge); border-radius:9999px; }
+    .clean-scroll::-webkit-scrollbar-track { background: transparent; }
+    .clean-scroll { scrollbar-width: thin; scrollbar-color: var(--edge) transparent; }
+
+    .field { width:100%; border-radius:.6rem; border:1px solid var(--edge); background: var(--input); padding:.55rem .75rem; font-size:.875rem; color: var(--ink); outline:none; }
+    .field:focus { border-color: var(--edge-strong); }
+    .field::placeholder { color: var(--ink-faint); }
+    .btn-accent { background: var(--accent); color: var(--bg); }
+  </style>
+</head>
+
+<body class="font-sans text-ink antialiased">
+
+  <!--
+    ┌──────────────────────────────────────────────────────┐
+    │   Today's Focus  —  One focus. Zero noise.            │
+    │   Designed & built by Jon Bassett.                    │
+    │   Hello, curious one. You found the source.           │
+    │   There's more hidden inside. Try:  ↑ ↑ ↓ ↓ ← → ← → B A │
+    └──────────────────────────────────────────────────────┘
+  -->
+
+  <!-- ============ AUTH SCREEN / MARKETING LANDING ============ -->
+  <div id="auth-screen" class="hidden">
+
+    <!-- Sticky top bar -->
+    <div class="sticky top-0 z-20 flex items-center justify-between border-b border-edge bg-panel px-5 py-3" style="backdrop-filter:blur(8px)">
+      <div class="flex items-center gap-2">
+        <span class="h-2 w-2 rounded-full bg-accent animate-pulse"></span>
+        <span class="text-sm font-semibold tracking-tight text-ink">Today's Focus</span>
+      </div>
+      <div id="auth-theme-toggle" class="js-theme-toggle flex items-center gap-1 rounded-full border border-edge bg-panel p-0.5"></div>
+    </div>
+
+    <!-- Two-column layout: login RIGHT on desktop, TOP on mobile -->
+    <div class="flex flex-col md:flex-row">
+
+      <!-- Login sidebar — appears first on mobile, right on desktop -->
+      <aside class="order-first md:order-last md:w-80 lg:w-96 shrink-0 flex flex-col justify-center border-b md:border-b-0 md:border-l border-edge bg-panel px-6 py-8 md:sticky md:top-[49px] md:h-[calc(100vh-49px)] md:self-start md:overflow-y-auto">
+        <div class="w-full max-w-xs mx-auto">
+          <p class="text-base font-semibold text-ink">Welcome</p>
+          <p id="auth-subtitle" class="mt-0.5 mb-5 text-sm text-ink-soft">Sign in to your board.</p>
+          <form id="auth-form" class="space-y-3" autocomplete="on">
+            <input id="auth-username" class="field" type="text" placeholder="Username" autocomplete="username" autocapitalize="none" spellcheck="false" />
+            <div id="auth-recovery-wrap" class="hidden">
+              <input id="auth-recovery-code" class="field" type="text" placeholder="Recovery code (xxxx-xxxx-xxxx)" autocomplete="off" autocapitalize="none" spellcheck="false" />
+            </div>
+            <input id="auth-password" class="field" type="password" placeholder="Password" autocomplete="current-password" />
+            <div id="auth-code-wrap" class="hidden">
+              <input id="auth-code" class="field" type="text" placeholder="Invite code" autocomplete="off" />
+            </div>
+            <!-- Honeypot: visually hidden, never filled by real users; bots fill it and are silently rejected -->
+            <div aria-hidden="true" style="position:absolute;left:-9999px;height:0;overflow:hidden">
+              <input id="hp-field" type="text" name="hp" tabindex="-1" autocomplete="off" />
+            </div>
+            <button id="auth-submit" type="submit" class="btn-accent w-full rounded-lg px-4 py-2.5 text-sm font-semibold transition hover:opacity-90">Sign in</button>
+          </form>
+          <p id="auth-error" class="mt-3 hidden text-sm text-red-400"></p>
+          <div class="mt-4 flex items-center justify-between gap-3">
+            <button id="auth-toggle" class="text-xs font-medium text-ink-soft transition hover:text-ink">Need an account? Register</button>
+            <button id="auth-forgot" class="text-xs font-medium text-ink-faint transition hover:text-ink">Forgot password?</button>
+          </div>
+          <div class="mt-8 border-t border-edge pt-6">
+            <p class="text-[11px] leading-relaxed text-ink-faint">Free to use. No subscriptions,<br>no ads, no tracking.</p>
+          </div>
+        </div>
+      </aside>
+
+      <!-- Marketing content — appears second on mobile, left on desktop -->
+      <main class="order-last md:order-first flex-1 px-6 py-12 md:py-16 lg:px-12 xl:px-20">
+
+        <!-- Hero -->
+        <section class="mb-16">
+          <div class="mb-5 inline-flex items-center gap-2 rounded-full border border-edge px-3 py-1 text-xs font-medium text-ink-soft">
+            <span class="h-1.5 w-1.5 rounded-full bg-accent"></span>
+            Free to use · Multi-user · No subscriptions
+          </div>
+          <h1 class="mb-5 text-4xl font-extrabold tracking-tight text-ink-strong sm:text-5xl lg:text-6xl" style="line-height:1.05">
+            One focus.<br>Zero noise.
+          </h1>
+          <p class="mb-8 max-w-2xl text-lg leading-relaxed text-ink-soft">
+            A minimalist productivity system built on a single rule — you may collect endless thoughts, projects, and goals, but only <strong class="font-semibold text-ink">one card</strong> sits in focus at a time.
+          </p>
+          <div class="flex flex-wrap gap-x-6 gap-y-2 text-sm text-ink-soft">
+            <span><span class="mr-1.5 font-bold text-accent">✦</span>6 pre-built boards</span>
+            <span><span class="mr-1.5 font-bold text-accent">✦</span>Daily spotlight picks</span>
+            <span><span class="mr-1.5 font-bold text-accent">✦</span>Focus streaks</span>
+            <span><span class="mr-1.5 font-bold text-accent">✦</span>Installable on phone</span>
+          </div>
+        </section>
+
+        <!-- App preview mockup -->
+        <section class="mb-16">
+          <div class="overflow-hidden rounded-2xl border border-edge-strong" style="box-shadow:0 8px 40px -12px rgba(0,0,0,0.45)">
+            <!-- Mini header bar -->
+            <div class="flex items-center justify-between border-b border-edge bg-panel px-4 py-2.5">
+              <div class="flex items-center gap-2">
+                <span class="h-1.5 w-1.5 rounded-full bg-accent"></span>
+                <span class="text-xs font-medium text-ink-soft">Today's Focus ▾</span>
+              </div>
+              <div class="flex items-center gap-2">
+                <div class="h-3 w-16 rounded-full bg-edge"></div>
+                <div class="h-3 w-3 rounded-full bg-edge"></div>
+              </div>
+            </div>
+            <!-- Focus zone + columns: centred at ~70% to match the real app layout -->
+            <div class="bg-panel px-6 py-4">
+              <div class="mx-auto" style="max-width:70%">
+                <!-- Focus zone -->
+                <div class="mb-3 rounded-xl px-6 py-6 text-center" style="border:2px solid var(--accent);box-shadow:0 0 50px -16px var(--accent)">
+                  <div class="mb-1 text-[10px] uppercase tracking-widest text-ink-faint">Today's Focus</div>
+                  <div class="truncate text-sm font-semibold text-ink">Finish the Henderson proposal</div>
+                </div>
+                <!-- Columns -->
+                <div class="grid grid-cols-3 gap-2">
+                  <div class="space-y-1.5">
+                    <div class="text-[9px] font-semibold uppercase tracking-wider text-ink-faint">Thoughts</div>
+                    <div class="truncate rounded-lg border border-edge bg-card px-2.5 py-1.5 text-[11px] text-ink-soft">Call the dentist</div>
+                    <div class="truncate rounded-lg border border-edge bg-card px-2.5 py-1.5 text-[11px] text-ink-soft">Pick up dry cleaning</div>
+                  </div>
+                  <div class="space-y-1.5">
+                    <div class="text-[9px] font-semibold uppercase tracking-wider text-ink-faint">Projects</div>
+                    <div class="truncate rounded-lg border border-edge bg-card px-2.5 py-1.5 text-[11px] font-medium text-accent" style="border-color:var(--accent)">Henderson proposal</div>
+                    <div class="truncate rounded-lg border border-edge bg-card px-2.5 py-1.5 text-[11px] text-ink-soft">Website redesign</div>
+                  </div>
+                  <div class="space-y-1.5">
+                    <div class="text-[9px] font-semibold uppercase tracking-wider text-ink-faint">Goals</div>
+                    <div class="truncate rounded-lg border border-edge bg-card px-2.5 py-1.5 text-[11px] text-ink-soft">Run 5k weekly</div>
+                    <div class="truncate rounded-lg border border-edge bg-card px-2.5 py-1.5 text-[11px] text-ink-soft">Read 12 books</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- Six boards -->
+        <section class="mb-16">
+          <h2 class="mb-4 text-xs font-semibold uppercase tracking-widest text-ink-faint">Six boards included</h2>
+          <div class="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
+            <div class="rounded-xl border border-edge bg-panel p-4 themed-shadow">
+              <div class="mb-3 text-2xl">🎯</div>
+              <div class="text-sm font-medium text-ink">Today's Focus</div>
+              <div class="mt-0.5 text-xs text-ink-faint">Thoughts · Projects · Goals</div>
+              <div class="mt-2.5 inline-flex items-center rounded-full border border-edge px-2 py-0.5 text-[10px] font-semibold text-accent">Always first</div>
+            </div>
+            <div class="rounded-xl border border-edge bg-panel p-4 themed-shadow">
+              <div class="mb-3 text-2xl">💬</div>
+              <div class="text-sm font-medium text-ink">Quotes</div>
+              <div class="mt-0.5 text-xs text-ink-faint">Quote of the day</div>
+              <div class="mt-2.5 text-[10px] text-ink-faint">✦ Rotates daily</div>
+            </div>
+            <div class="rounded-xl border border-edge bg-panel p-4 themed-shadow">
+              <div class="mb-3 text-2xl">🌟</div>
+              <div class="text-sm font-medium text-ink">Affirmations</div>
+              <div class="mt-0.5 text-xs text-ink-faint">Daily affirmation</div>
+              <div class="mt-2.5 text-[10px] text-ink-faint">✦ Rotates daily</div>
+            </div>
+            <div class="rounded-xl border border-edge bg-panel p-4 themed-shadow">
+              <div class="mb-3 text-2xl">📚</div>
+              <div class="text-sm font-medium text-ink">Books</div>
+              <div class="mt-0.5 text-xs text-ink-faint">Currently reading</div>
+              <div class="mt-2.5 text-[10px] text-ink-faint">Drag to focus</div>
+            </div>
+            <div class="rounded-xl border border-edge bg-panel p-4 themed-shadow">
+              <div class="mb-3 text-2xl">🎮</div>
+              <div class="text-sm font-medium text-ink">Games</div>
+              <div class="mt-0.5 text-xs text-ink-faint">Currently playing</div>
+              <div class="mt-2.5 text-[10px] text-ink-faint">Drag to focus</div>
+            </div>
+            <div class="rounded-xl border border-edge bg-panel p-4 themed-shadow">
+              <div class="mb-3 text-2xl">✅</div>
+              <div class="text-sm font-medium text-ink">Routines</div>
+              <div class="mt-0.5 text-xs text-ink-faint">Daily habits</div>
+              <div class="mt-2.5 text-[10px] text-ink-faint">+ Create your own</div>
+            </div>
+          </div>
+        </section>
+
+        <!-- How it works -->
+        <section class="mb-16">
+          <h2 class="mb-4 text-xs font-semibold uppercase tracking-widest text-ink-faint">How it works</h2>
+          <div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+            <div class="rounded-xl border border-edge bg-panel p-5 themed-shadow">
+              <div class="mb-3 text-2xl">🎯</div>
+              <h3 class="mb-1.5 text-sm font-semibold text-ink">One rule. One focus.</h3>
+              <p class="text-sm leading-relaxed text-ink-soft">Drag any card into the focus zone. Drag a second one in and the first steps aside — only one thing at a time, always.</p>
+            </div>
+            <div class="rounded-xl border border-edge bg-panel p-5 themed-shadow">
+              <div class="mb-3 text-2xl">🌅</div>
+              <h3 class="mb-1.5 text-sm font-semibold text-ink">Daily spotlight</h3>
+              <p class="text-sm leading-relaxed text-ink-soft">Quotes and Affirmations boards automatically surface a fresh card each day — same all day, new one tomorrow. No manual rotation needed.</p>
+            </div>
+            <div class="rounded-xl border border-edge bg-panel p-5 themed-shadow">
+              <div class="mb-3 text-2xl">🔥</div>
+              <h3 class="mb-1.5 text-sm font-semibold text-ink">Focus streaks</h3>
+              <p class="text-sm leading-relaxed text-ink-soft">Every day you set a focus is logged. Build your streak, review your history, and see exactly what you were focused on and when.</p>
+            </div>
+            <div class="rounded-xl border border-edge bg-panel p-5 themed-shadow">
+              <div class="mb-3 text-2xl">📱</div>
+              <h3 class="mb-1.5 text-sm font-semibold text-ink">Works on any device</h3>
+              <p class="text-sm leading-relaxed text-ink-soft">Install Today's Focus to your home screen on iPhone, Android, or desktop. Opens instantly like a native app — no app store needed.</p>
+            </div>
+          </div>
+        </section>
+
+        <!-- Themes -->
+        <section class="mb-16">
+          <h2 class="mb-4 text-xs font-semibold uppercase tracking-widest text-ink-faint">Three themes</h2>
+          <div class="flex flex-wrap gap-3">
+            <div class="flex items-center gap-2.5 rounded-lg border border-edge bg-panel px-4 py-2.5 text-sm themed-shadow">
+              <div class="h-3.5 w-3.5 rounded-full border border-edge" style="background:#09090b"></div>
+              <span class="text-ink-soft">Dark</span>
+            </div>
+            <div class="flex items-center gap-2.5 rounded-lg border border-edge bg-panel px-4 py-2.5 text-sm themed-shadow">
+              <div class="h-3.5 w-3.5 rounded-full border border-edge" style="background:#eeeeef"></div>
+              <span class="text-ink-soft">Light</span>
+            </div>
+            <div class="flex items-center gap-2.5 rounded-lg border border-edge bg-panel px-4 py-2.5 text-sm themed-shadow">
+              <div class="h-3.5 w-3.5 rounded-full border border-edge" style="background:#c9b18b"></div>
+              <span class="text-ink-soft">Cardboard</span>
+            </div>
+          </div>
+          <p class="mt-3 text-xs text-ink-faint">Switch anytime from the header. Saved per device.</p>
+        </section>
+
+        <!-- Self-hosted callout -->
+        <section class="mb-10">
+          <div class="rounded-xl border border-edge bg-panel p-5 themed-shadow flex items-start gap-4">
+            <div class="text-2xl shrink-0">🖥️</div>
+            <div>
+              <h3 class="mb-1 text-sm font-semibold text-ink">Interested in self-hosting?</h3>
+              <p class="text-sm leading-relaxed text-ink-soft">A self-hosted version of Today's Focus — run it on your own server, keep full control of your data. Coming soon for home labs, families, and teams who want to own their stack.</p>
+            </div>
+          </div>
+        </section>
+
+        <!-- Footer -->
+        <footer class="border-t border-edge pb-16 pt-8">
+          <div class="flex flex-wrap items-center gap-x-6 gap-y-1.5 text-xs text-ink-faint">
+            <span>No subscriptions · No ads · No tracking</span>
+            <span>Free to use</span>
+            <span>Works on iOS · Android · Desktop</span>
+            <a href="/privacy" class="transition hover:text-ink-soft">Privacy &amp; Terms</a>
+          </div>
+        </footer>
+
+      </main>
+    </div>
+  </div>
+
+  <!-- ============ APP ============ -->
+  <div id="app" class="mx-auto hidden min-h-screen max-w-[1400px] flex-col gap-4 p-4 md:h-screen md:gap-5 md:p-6">
+    <header class="flex shrink-0 items-center justify-between gap-3 px-1">
+      <div id="board-switcher" class="relative"></div>
+      <div class="flex items-center gap-3">
+        <span id="today" class="hidden text-xs text-ink-soft md:inline"></span>
+        <div id="streak-slot" class="flex items-center"></div>
+        <div id="donate-slot" class="flex items-center"></div>
+        <div id="theme-toggle" class="js-theme-toggle hidden md:flex items-center gap-1 rounded-full border border-edge bg-panel p-0.5 themed-shadow"></div>
+        <div id="user-menu" class="relative"></div>
+      </div>
+    </header>
+
+    <section id="focus-zone" class="flex min-h-[32vh] flex-[3] items-center justify-center md:min-h-0"></section>
+    <section id="columns" class="grid min-h-0 flex-[7] grid-cols-1 gap-4 md:grid-cols-3"></section>
+  </div>
+
+  <!-- ============ MODALS (filled by app.js) ============ -->
+  <div id="account-modal" class="modal-backdrop fixed inset-0 z-40 hidden items-center justify-center p-4"></div>
+  <div id="admin-modal" class="modal-backdrop fixed inset-0 z-40 hidden items-center justify-center p-4"></div>
+  <div id="history-modal" class="modal-backdrop fixed inset-0 z-40 hidden items-center justify-center p-4"></div>
+  <div id="archive-modal" class="modal-backdrop fixed inset-0 z-40 hidden items-center justify-center p-4"></div>
+  <div id="boards-modal" class="modal-backdrop fixed inset-0 z-40 hidden items-center justify-center p-4"></div>
+  <div id="recovery-modal" class="modal-backdrop fixed inset-0 z-50 hidden items-center justify-center p-4"></div>
+  <div id="help-modal"     class="modal-backdrop fixed inset-0 z-40 hidden items-center justify-center p-4"></div>
+
+  <!-- ============ TOAST ============ -->
+  <div id="toast" class="pointer-events-none fixed bottom-5 left-1/2 z-50 -translate-x-1/2 translate-y-2 rounded-lg border border-edge bg-panel px-4 py-2 text-sm text-ink opacity-0 shadow-xl themed-shadow transition-all duration-300"></div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
