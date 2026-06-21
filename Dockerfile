@@ -1,6 +1,6 @@
 # ---- Today's Focus : production image ----
 # Node 24 ships SQLite built-in (node:sqlite), so there is NO native build step.
-FROM node:24-alpine
+FROM node:24-slim
 
 ENV NODE_ENV=production \
     PORT=3000 \
@@ -24,6 +24,6 @@ EXPOSE 3000
 VOLUME ["/app/data"]
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-  CMD wget -qO- "http://127.0.0.1:${PORT}/api/health" >/dev/null 2>&1 || exit 1
+  CMD node -e "fetch('http://127.0.0.1:${PORT}/api/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
 
 CMD ["node", "server.js"]
