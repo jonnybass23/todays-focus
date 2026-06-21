@@ -6,8 +6,7 @@
 # then issue Secure cookies automatically.
 services:
   todays-focus:
-    build: .
-    image: todays-focus:latest
+    image: ghcr.io/jonnybass23/todays-focus:latest
     container_name: todays-focus
     restart: unless-stopped
     ports:
