@@ -2,8 +2,7 @@
 # Node 24 ships SQLite built-in (node:sqlite), so there is NO native build step.
 FROM node:24-slim
 
-ENV NODE_ENV=production \
-    PORT=3000 \
+ENV PORT=3000 \
     DATA_DIR=/app/data
 
 WORKDIR /app
@@ -15,6 +14,9 @@ RUN npm install && npm cache clean --force
 # App source + build static CSS, then prune dev deps
 COPY . .
 RUN npm run build:css && npm prune --omit=dev
+
+# Switch to production runtime mode (after dev deps were used to build the CSS)
+ENV NODE_ENV=production
 
 # Persist the database outside the image; run unprivileged
 RUN mkdir -p "$DATA_DIR" && chown -R node:node /app
