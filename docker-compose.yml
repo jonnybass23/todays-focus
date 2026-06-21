@@ -17,6 +17,11 @@ services:
       # Your timezone — controls when "today" rolls over for focus streaks.
       - TZ=${TZ:-UTC}
 
+      # Run as this host user/group so the mounted data dir is writable.
+      # On Unraid use 99:100 (nobody:users). Defaults to 1000:1000.
+      - PUID=${PUID:-1000}
+      - PGID=${PGID:-1000}
+
       # --- SECURITY: set a long random secret so logins survive restarts/redeploys ---
       # Generate one:  openssl rand -hex 48
       - JWT_SECRET=${JWT_SECRET:-please-change-me-to-a-long-random-string}
