@@ -777,8 +777,9 @@ function cardEl(card) {
   const expanded = expandedCards.has(card.id);
   const fresh = !seenCards.has(card.id); seenCards.add(card.id);
   const node = el('article', `${fresh ? 'card-enter ' : ''}themed-shadow group relative select-none rounded-xl border border-edge bg-card px-4 py-3 text-sm text-ink transition hover:border-edge-strong ${editing ? '' : 'cursor-grab active:cursor-grabbing'}`);
-  node.draggable = !editing; node.dataset.cardId = card.id; node.title = 'Drag to reorder/move · double-click to focus';
+  node.draggable = !editing; node.dataset.cardId = card.id; node.title = 'Drag to reorder/move · double-click to focus · right-click for actions';
   node.addEventListener('dblclick', () => { if (isSpotlight() || ui.editingCard === card.id) return; moveCard(card.id, { focused: true }); });
+  node.addEventListener('contextmenu', (e) => { if (ui.editingCard === card.id) return; e.preventDefault(); openCardMenu(card, node, { multiBoard: boards.length > 1, x: e.clientX, y: e.clientY }); });
   if (card.priority) {
     const PRIO_HEX  = ['','#60a5fa','#fbbf24','#f87171'];
     const PRIO_RGBA = ['','rgba(96,165,250,0.10)','rgba(251,191,36,0.10)','rgba(248,113,113,0.10)'];
@@ -1100,15 +1101,23 @@ function openCardMenu(card, anchorEl, opts = {}) {
     pRow.appendChild(b);
   });
   menu.appendChild(pRow);
-  addItem(PENCIL_SVG, 'Edit text', '', () => { ui.editingCard = card.id; render(); });
+  // Inline-edit on the board (where the card is live); a modal everywhere else.
+  addItem(PENCIL_SVG, 'Edit text', '', () => { if (currentView.kind === 'board' && state.cards.some((c) => c.id === card.id)) { ui.editingCard = card.id; render(); } else openTaskModal(card); });
   addItem(CLOCK_SVG, 'Details · due · tags', '', () => openTaskModal(card));
   if (opts.multiBoard) addItem(MOVE_SVG, 'Move to board', '', () => openMoveMenu(card, anchorEl));
   addItem(TRASH_SVG, 'Archive', 'text-red-400 hover:text-red-300', () => archiveCard(card.id));
   document.body.appendChild(menu);
-  const r = anchorEl.getBoundingClientRect(), mw = 160;
-  let left = Math.max(8, Math.min(r.right - mw, window.innerWidth - mw - 8));
-  let top = r.bottom + 4;
-  if (top + menu.offsetHeight > window.innerHeight - 8) top = Math.max(8, r.top - menu.offsetHeight - 4);
+  const mw = 160;
+  let left, top;
+  if (opts.x != null && opts.y != null) { // right-click: open at the cursor
+    left = Math.max(8, Math.min(opts.x, window.innerWidth - mw - 8));
+    top = (opts.y + menu.offsetHeight > window.innerHeight - 8) ? Math.max(8, opts.y - menu.offsetHeight) : opts.y;
+  } else {
+    const r = anchorEl.getBoundingClientRect();
+    left = Math.max(8, Math.min(r.right - mw, window.innerWidth - mw - 8));
+    top = r.bottom + 4;
+    if (top + menu.offsetHeight > window.innerHeight - 8) top = Math.max(8, r.top - menu.offsetHeight - 4);
+  }
   menu.style.left = left + 'px'; menu.style.top = top + 'px';
   const away = (e) => { if (!menu.contains(e.target)) closeCardMenu(); };
   const onKey = (e) => { if (e.key === 'Escape') closeCardMenu(); };
@@ -1309,6 +1318,7 @@ function viewMeta() {
     case 'today': return { icon: '📅', title: 'Today' };
     case 'upcoming': return { icon: '🗓️', title: 'Next 7 days' };
     case 'calendar': return { icon: '📆', title: 'Calendar' };
+    case 'timeline': return { icon: '📊', title: 'Timeline' };
     case 'matrix': return { icon: '🔲', title: 'Priority Matrix' };
     case 'habits': return { icon: '🌱', title: 'Habits' };
     case 'journal': return { icon: '📓', title: 'Journal' };
@@ -1422,6 +1432,7 @@ function renderSmartViews() {
     { kind: 'today', icon: '📅', label: 'Today', count: todayN },
     { kind: 'upcoming', icon: '🗓️', label: 'Next 7 days', count: upN },
     { kind: 'calendar', icon: '📆', label: 'Calendar' },
+    { kind: 'timeline', icon: '📊', label: 'Timeline' },
     { kind: 'matrix', icon: '🔲', label: 'Priority Matrix' },
     { kind: 'habits', icon: '🌱', label: 'Habits' },
     { kind: 'journal', icon: '📓', label: 'Journal' },
@@ -1501,6 +1512,7 @@ function groupHeader(text) { return el('div', 'px-1 pb-1 pt-3 text-[10px] font-s
 function renderListView() {
   const root = $('#list-view'); if (!root) return; root.innerHTML = '';
   if (currentView.kind === 'calendar') { $('#view-count').textContent = ''; renderCalendar(root); return; }
+  if (currentView.kind === 'timeline') { renderTimeline(root); return; }
   if (currentView.kind === 'journal') { $('#view-count').textContent = ''; renderJournal(root); return; }
   if (currentView.kind === 'matrix') { renderMatrix(root); return; }
   if (currentView.kind === 'habits') { renderHabits(root); return; }
@@ -1555,6 +1567,7 @@ function listEmptyState() {
 function taskRow(card) {
   const row = el('div', 'group flex items-start gap-3 rounded-xl border border-edge bg-card px-3 py-2.5 transition hover:border-edge-strong');
   if (card.priority) { row.style.borderLeftColor = PRIORITY_HEX[card.priority]; row.style.borderLeftWidth = '3px'; }
+  row.addEventListener('contextmenu', (e) => { e.preventDefault(); openCardMenu(card, row, { multiBoard: boards.length > 1, x: e.clientX, y: e.clientY }); });
   const box = el('button', 'mt-0.5 grid h-4 w-4 shrink-0 place-items-center rounded-full border-2 text-transparent transition hover:text-ink-soft');
   box.style.borderColor = priorityColor(card.priority) || 'var(--ink-faint)'; box.title = 'Complete'; box.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" class="h-2.5 w-2.5"><path d="M20 6 9 17l-5-5"/></svg>';
   box.addEventListener('click', (e) => { e.stopPropagation(); completeCard(card.id); });
@@ -1708,6 +1721,91 @@ function renderMatrix(root) {
     box.append(head, body); grid.append(box);
   });
   root.append(grid);
+}
+
+// ---- Timeline (Gantt-style: bars from start → due, grouped by project) ----
+function renderTimeline(root) {
+  root.innerHTML = '';
+  const DAY = 86400000, DW = 44, LABELW = 180, ROWH = 34, HEADERH = 54, GROUPH = 30;
+  const dated = allCards.filter((c) => c.dueAt || c.startAt);
+  $('#view-count').textContent = dated.length ? String(dated.length) : '';
+  if (!dated.length) {
+    const box = el('div', 'flex h-full flex-col items-center justify-center gap-3 px-6 text-center');
+    box.append(el('div', 'text-4xl', '📊'), el('p', 'max-w-sm text-sm text-ink-faint', 'No scheduled tasks yet — give tasks a start or due date and they’ll appear here.'));
+    root.append(box); return;
+  }
+  const spanOf = (c) => [dayStart(new Date(c.startAt || c.dueAt)), dayStart(new Date(c.dueAt || c.startAt))];
+  let minMs = Infinity, maxMs = -Infinity;
+  dated.forEach((c) => { const [s, e] = spanOf(c); minMs = Math.min(minMs, s.getTime()); maxMs = Math.max(maxMs, e.getTime()); });
+  const todayS = todayStart(), todayMs = todayS.getTime();
+  let start = dayStart(new Date(Math.min(minMs, todayMs))); start.setDate(start.getDate() - 3);
+  let end = dayStart(new Date(Math.max(maxMs, todayMs))); end.setDate(end.getDate() + 5);
+  let days = Math.round((end - start) / DAY) + 1;
+  if (days > 540) days = 540;
+  const totalW = LABELW + days * DW;
+  const idxOf = (d) => Math.round((dayStart(d) - start) / DAY);
+
+  const groups = new Map();
+  dated.forEach((c) => { const k = c.boardId || 'none'; if (!groups.has(k)) groups.set(k, []); groups.get(k).push(c); });
+  groups.forEach((arr) => arr.sort((a, b) => new Date(a.startAt || a.dueAt) - new Date(b.startAt || b.dueAt)));
+
+  const scroll = el('div', 'clean-scroll relative h-full w-full overflow-auto');
+  const inner = el('div', 'relative'); inner.style.width = totalW + 'px';
+
+  const grid = el('div', 'pointer-events-none absolute bottom-0'); grid.style.top = HEADERH + 'px'; grid.style.left = LABELW + 'px'; grid.style.right = '0';
+  grid.style.backgroundImage = `repeating-linear-gradient(90deg, var(--edge) 0 1px, transparent 1px ${DW}px)`; grid.style.opacity = '0.4';
+  inner.append(grid);
+
+  const header = el('div', 'sticky top-0 z-20 flex border-b border-edge bg-panel'); header.style.height = HEADERH + 'px';
+  const corner = el('div', 'sticky left-0 z-30 flex shrink-0 items-center border-r border-edge bg-panel px-3'); corner.style.width = LABELW + 'px';
+  const todayBtn = el('button', 'rounded-lg border border-edge px-2.5 py-1 text-xs font-medium text-ink-soft transition hover:text-ink', '⦿ Today');
+  corner.append(todayBtn); header.append(corner);
+  for (let i = 0; i < days; i++) {
+    const d = new Date(start.getTime() + i * DAY);
+    const weekend = d.getDay() === 0 || d.getDay() === 6;
+    const cell = el('div', 'flex shrink-0 flex-col items-center justify-center border-r border-edge'); cell.style.width = DW + 'px';
+    if (weekend) cell.style.background = 'var(--focus-tint)';
+    if (d.getDate() === 1 || i === 0) cell.append(el('div', 'text-[9px] font-bold leading-none text-ink', d.toLocaleDateString([], { month: 'short' })));
+    cell.append(el('div', 'text-[11px] font-medium leading-tight ' + (weekend ? 'text-ink-faint' : 'text-ink'), String(d.getDate())));
+    cell.append(el('div', 'text-[8px] ' + (weekend ? 'text-ink-faint' : 'text-ink-soft'), ['S', 'M', 'T', 'W', 'T', 'F', 'S'][d.getDay()]));
+    header.append(cell);
+  }
+  inner.append(header);
+
+  groups.forEach((cards, bid) => {
+    const b = boards.find((x) => x.id === bid);
+    const grow = el('div', 'relative border-b border-edge'); grow.style.height = GROUPH + 'px'; grow.style.width = totalW + 'px'; grow.style.background = 'var(--panel)';
+    const gh = el('div', 'sticky left-0 z-10 flex h-full items-center gap-2 border-r border-edge bg-panel px-3 text-xs font-semibold text-ink'); gh.style.width = LABELW + 'px';
+    gh.append(el('span', 'shrink-0', b ? b.icon : '🗂️'), el('span', 'truncate', b ? b.name : 'Other'));
+    grow.append(gh); inner.append(grow);
+    cards.forEach((c) => {
+      const row = el('div', 'relative border-b border-edge'); row.style.height = ROWH + 'px'; row.style.width = totalW + 'px';
+      const label = el('div', 'sticky left-0 z-10 flex h-full items-center border-r border-edge bg-panel px-3'); label.style.width = LABELW + 'px';
+      const lt = el('button', 'w-full truncate text-left text-xs text-ink transition hover:text-ink-strong', c.title); lt.addEventListener('click', () => openTaskModal(c)); label.append(lt);
+      row.append(label);
+      const [s, e] = spanOf(c);
+      const off = idxOf(s), spanDays = Math.max(1, idxOf(e) - off + 1);
+      const overdue = dueClass(c.dueAt) === 'overdue';
+      const bar = el('button', 'absolute truncate rounded-md px-1.5 text-left text-[10px] font-medium transition hover:brightness-95');
+      bar.style.left = (LABELW + off * DW + 2) + 'px'; bar.style.width = (spanDays * DW - 4) + 'px'; bar.style.top = '5px'; bar.style.height = (ROWH - 10) + 'px'; bar.style.lineHeight = (ROWH - 10) + 'px';
+      bar.style.background = overdue ? '#f87171' : (PRIORITY_HEX[c.priority] || '#94a3b8'); bar.style.color = 'rgba(0,0,0,0.78)';
+      bar.textContent = spanDays >= 2 ? c.title : '';
+      bar.title = c.title + (c.startAt ? ' · start ' + formatDue(c.startAt) : '') + (c.dueAt ? ' → due ' + formatDue(c.dueAt) : '');
+      bar.addEventListener('click', () => openTaskModal(c));
+      row.append(bar); inner.append(row);
+    });
+  });
+
+  const tOff = idxOf(todayS);
+  if (tOff >= 0 && tOff < days) {
+    const line = el('div', 'pointer-events-none absolute z-10'); line.style.left = (LABELW + tOff * DW) + 'px'; line.style.top = HEADERH + 'px'; line.style.bottom = '0'; line.style.width = '2px'; line.style.background = 'var(--accent)'; line.style.opacity = '0.8';
+    inner.append(line);
+  }
+
+  scroll.append(inner); root.append(scroll);
+  const jumpToday = () => { scroll.scrollLeft = Math.max(0, LABELW + tOff * DW - scroll.clientWidth / 2); };
+  todayBtn.addEventListener('click', jumpToday);
+  requestAnimationFrame(jumpToday);
 }
 
 // ---- Calendar (month grid of tasks by due date) ----
@@ -2103,7 +2201,7 @@ async function poll() {
       if (JSON.stringify(cards) !== JSON.stringify(state.cards)) { state.cards = cards; render(); }
     }
     const { cards: ac } = await request('/active');
-    if (JSON.stringify(ac) !== JSON.stringify(allCards)) { allCards = ac; renderSidebar(); if (currentView.kind !== 'board' && currentView.kind !== 'journal' && currentView.kind !== 'habits') renderListView(); }
+    if (JSON.stringify(ac) !== JSON.stringify(allCards)) { allCards = ac; renderSidebar(); if (!['board', 'journal', 'habits', 'timeline'].includes(currentView.kind)) renderListView(); }
   } catch (err) { if (err.status === 401) forceReauth(); }
 }
 
