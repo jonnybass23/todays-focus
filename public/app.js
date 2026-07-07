@@ -777,8 +777,9 @@ function cardEl(card) {
   const expanded = expandedCards.has(card.id);
   const fresh = !seenCards.has(card.id); seenCards.add(card.id);
   const node = el('article', `${fresh ? 'card-enter ' : ''}themed-shadow group relative select-none rounded-xl border border-edge bg-card px-4 py-3 text-sm text-ink transition hover:border-edge-strong ${editing ? '' : 'cursor-grab active:cursor-grabbing'}`);
-  node.draggable = !editing; node.dataset.cardId = card.id; node.title = 'Drag to reorder/move · double-click to focus';
+  node.draggable = !editing; node.dataset.cardId = card.id; node.title = 'Drag to reorder/move · double-click to focus · right-click for actions';
   node.addEventListener('dblclick', () => { if (isSpotlight() || ui.editingCard === card.id) return; moveCard(card.id, { focused: true }); });
+  node.addEventListener('contextmenu', (e) => { if (ui.editingCard === card.id) return; e.preventDefault(); openCardMenu(card, node, { multiBoard: boards.length > 1, x: e.clientX, y: e.clientY }); });
   if (card.priority) {
     const PRIO_HEX  = ['','#60a5fa','#fbbf24','#f87171'];
     const PRIO_RGBA = ['','rgba(96,165,250,0.10)','rgba(251,191,36,0.10)','rgba(248,113,113,0.10)'];
@@ -1100,15 +1101,23 @@ function openCardMenu(card, anchorEl, opts = {}) {
     pRow.appendChild(b);
   });
   menu.appendChild(pRow);
-  addItem(PENCIL_SVG, 'Edit text', '', () => { ui.editingCard = card.id; render(); });
+  // Inline-edit on the board (where the card is live); a modal everywhere else.
+  addItem(PENCIL_SVG, 'Edit text', '', () => { if (currentView.kind === 'board' && state.cards.some((c) => c.id === card.id)) { ui.editingCard = card.id; render(); } else openTaskModal(card); });
   addItem(CLOCK_SVG, 'Details · due · tags', '', () => openTaskModal(card));
   if (opts.multiBoard) addItem(MOVE_SVG, 'Move to board', '', () => openMoveMenu(card, anchorEl));
   addItem(TRASH_SVG, 'Archive', 'text-red-400 hover:text-red-300', () => archiveCard(card.id));
   document.body.appendChild(menu);
-  const r = anchorEl.getBoundingClientRect(), mw = 160;
-  let left = Math.max(8, Math.min(r.right - mw, window.innerWidth - mw - 8));
-  let top = r.bottom + 4;
-  if (top + menu.offsetHeight > window.innerHeight - 8) top = Math.max(8, r.top - menu.offsetHeight - 4);
+  const mw = 160;
+  let left, top;
+  if (opts.x != null && opts.y != null) { // right-click: open at the cursor
+    left = Math.max(8, Math.min(opts.x, window.innerWidth - mw - 8));
+    top = (opts.y + menu.offsetHeight > window.innerHeight - 8) ? Math.max(8, opts.y - menu.offsetHeight) : opts.y;
+  } else {
+    const r = anchorEl.getBoundingClientRect();
+    left = Math.max(8, Math.min(r.right - mw, window.innerWidth - mw - 8));
+    top = r.bottom + 4;
+    if (top + menu.offsetHeight > window.innerHeight - 8) top = Math.max(8, r.top - menu.offsetHeight - 4);
+  }
   menu.style.left = left + 'px'; menu.style.top = top + 'px';
   const away = (e) => { if (!menu.contains(e.target)) closeCardMenu(); };
   const onKey = (e) => { if (e.key === 'Escape') closeCardMenu(); };
@@ -1558,6 +1567,7 @@ function listEmptyState() {
 function taskRow(card) {
   const row = el('div', 'group flex items-start gap-3 rounded-xl border border-edge bg-card px-3 py-2.5 transition hover:border-edge-strong');
   if (card.priority) { row.style.borderLeftColor = PRIORITY_HEX[card.priority]; row.style.borderLeftWidth = '3px'; }
+  row.addEventListener('contextmenu', (e) => { e.preventDefault(); openCardMenu(card, row, { multiBoard: boards.length > 1, x: e.clientX, y: e.clientY }); });
   const box = el('button', 'mt-0.5 grid h-4 w-4 shrink-0 place-items-center rounded-full border-2 text-transparent transition hover:text-ink-soft');
   box.style.borderColor = priorityColor(card.priority) || 'var(--ink-faint)'; box.title = 'Complete'; box.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" class="h-2.5 w-2.5"><path d="M20 6 9 17l-5-5"/></svg>';
   box.addEventListener('click', (e) => { e.stopPropagation(); completeCard(card.id); });
