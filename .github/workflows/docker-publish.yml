@@ -39,3 +39,6 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Unraid shows "Version: not available" for GHCR images with attestations — disable them
+          provenance: false
+          sbom: false
