@@ -82,6 +82,20 @@
     .field:focus { border-color: var(--edge-strong); }
     .field::placeholder { color: var(--ink-faint); }
     .btn-accent { background: var(--accent); color: var(--bg); }
+
+    /* Sidebar: static column on desktop, slide-in drawer on mobile */
+    @media (max-width: 767px) {
+      #sidebar { position: fixed; top:0; bottom:0; left:0; z-index:30; transform: translateX(-100%); transition: transform .2s ease; box-shadow: 0 0 40px rgba(0,0,0,0.4); }
+      #sidebar.open { transform: translateX(0); }
+    }
+    .nav-item { display:flex; align-items:center; gap:.6rem; width:100%; border-radius:.6rem; padding:.5rem .6rem; font-size:.875rem; color:var(--ink-soft); text-align:left; transition: background .15s, color .15s; }
+    .nav-item:hover { background: var(--edge); color: var(--ink); }
+    .nav-item.active { background: var(--edge); color: var(--ink); font-weight:600; }
+    .nav-count { margin-left:auto; font-size:.7rem; color:var(--ink-faint); font-variant-numeric: tabular-nums; }
+    .due-pill { display:inline-flex; align-items:center; gap:.25rem; border-radius:9999px; padding:.05rem .4rem; font-size:.68rem; font-weight:600; line-height:1.4; border:1px solid var(--edge); color:var(--ink-soft); }
+    .due-pill.overdue { color:#f87171; border-color:rgba(248,113,113,.4); }
+    .due-pill.today { color:var(--accent); border-color:color-mix(in srgb, var(--accent) 40%, transparent); }
+    .tag-chip { display:inline-flex; align-items:center; border-radius:9999px; padding:.05rem .4rem; font-size:.68rem; font-weight:500; background:var(--edge); color:var(--ink-soft); }
   </style>
 </head>
 
@@ -326,20 +340,69 @@
   </div>
 
   <!-- ============ APP ============ -->
-  <div id="app" class="mx-auto hidden min-h-screen max-w-[1400px] flex-col gap-4 p-4 md:h-screen md:gap-5 md:p-6">
-    <header class="flex shrink-0 items-center justify-between gap-3 px-1">
-      <div id="board-switcher" class="relative"></div>
-      <div class="flex items-center gap-3">
-        <span id="today" class="hidden text-xs text-ink-soft md:inline"></span>
-        <div id="streak-slot" class="flex items-center"></div>
-        <div id="donate-slot" class="flex items-center"></div>
-        <div id="theme-toggle" class="js-theme-toggle hidden md:flex items-center gap-1 rounded-full border border-edge bg-panel p-0.5 themed-shadow"></div>
-        <div id="user-menu" class="relative"></div>
-      </div>
-    </header>
+  <div id="app" class="hidden h-screen overflow-hidden">
+    <div class="flex h-full w-full min-w-0">
 
-    <section id="focus-zone" class="flex min-h-[32vh] flex-[3] items-center justify-center md:min-h-0"></section>
-    <section id="columns" class="grid min-h-0 flex-[7] grid-cols-1 gap-4 md:grid-cols-3"></section>
+      <!-- ===== SIDEBAR ===== -->
+      <aside id="sidebar" class="flex w-64 shrink-0 flex-col border-r border-edge bg-panel">
+        <div class="flex items-center gap-2 border-b border-edge px-4 py-3">
+          <span class="h-2 w-2 rounded-full bg-accent"></span>
+          <span class="text-sm font-semibold tracking-tight text-ink">Today's Focus</span>
+        </div>
+        <div class="p-3"><div id="quick-add"></div></div>
+        <div class="clean-scroll flex-1 overflow-y-auto px-2 pb-3">
+          <nav id="smart-views" class="space-y-0.5"></nav>
+          <div class="mb-1 mt-5 flex items-center justify-between px-2">
+            <span class="text-[10px] font-semibold uppercase tracking-wider text-ink-faint">Projects</span>
+            <button id="add-project-btn" class="grid h-5 w-5 place-items-center rounded text-ink-faint transition hover:bg-edge hover:text-ink" title="New project">+</button>
+          </div>
+          <nav id="sidebar-projects" class="space-y-0.5"></nav>
+          <div class="mb-1 mt-5 flex items-center justify-between px-2">
+            <span class="text-[10px] font-semibold uppercase tracking-wider text-ink-faint">Filters</span>
+            <button id="add-filter-btn" class="grid h-5 w-5 place-items-center rounded text-ink-faint transition hover:bg-edge hover:text-ink" title="New filter">+</button>
+          </div>
+          <nav id="sidebar-filters" class="space-y-0.5"></nav>
+          <div id="sidebar-tags-wrap" class="mt-5 hidden">
+            <div class="mb-1.5 px-2 text-[10px] font-semibold uppercase tracking-wider text-ink-faint">Tags</div>
+            <div id="sidebar-tags" class="flex flex-wrap gap-1 px-2"></div>
+          </div>
+        </div>
+        <div class="shrink-0 border-t border-edge p-2">
+          <div id="user-menu" class="relative"></div>
+        </div>
+      </aside>
+      <!-- mobile backdrop for the sidebar drawer -->
+      <div id="sidebar-backdrop" class="fixed inset-0 z-20 hidden bg-black/50 md:hidden"></div>
+
+      <!-- ===== MAIN ===== -->
+      <main class="flex min-w-0 flex-1 flex-col">
+        <header class="flex shrink-0 items-center justify-between gap-3 border-b border-edge px-4 py-2.5">
+          <div class="flex min-w-0 items-center gap-2">
+            <button id="sidebar-toggle" class="grid h-8 w-8 shrink-0 place-items-center rounded-lg text-ink-soft transition hover:bg-edge hover:text-ink md:hidden" title="Menu" aria-label="Menu">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" class="h-5 w-5"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
+            </button>
+            <span id="view-icon" class="shrink-0 text-lg leading-none"></span>
+            <span id="view-title" class="truncate text-sm font-semibold text-ink"></span>
+            <span id="view-count" class="shrink-0 text-xs tabular-nums text-ink-faint"></span>
+            <input id="header-search" type="search" placeholder="Search tasks…" autocomplete="off" class="ml-3 hidden w-40 shrink-0 rounded-lg border border-edge bg-panel px-2.5 py-1 text-xs text-ink outline-none transition focus:w-56 focus:border-edge-strong sm:block" />
+          </div>
+          <div class="flex items-center gap-2">
+            <button id="focus-toggle" class="hidden items-center gap-1.5 rounded-full border border-edge px-3 py-1.5 text-xs font-medium text-ink-soft transition hover:border-edge-strong hover:text-ink" title="Toggle the Focus Zone">🎯 <span class="hidden sm:inline">Focus</span></button>
+            <button id="pomodoro-btn" class="flex items-center gap-1 rounded-full border border-edge px-2.5 py-1.5 text-xs font-medium text-ink-soft transition hover:border-edge-strong hover:text-ink" title="Pomodoro focus timer"><span>🍅</span><span id="pomodoro-label" class="hidden tabular-nums"></span></button>
+            <span id="today" class="hidden text-xs text-ink-soft lg:inline"></span>
+            <div id="streak-slot" class="flex items-center"></div>
+            <div id="donate-slot" class="flex items-center"></div>
+            <div id="theme-toggle" class="js-theme-toggle hidden md:flex items-center gap-1 rounded-full border border-edge bg-panel p-0.5 themed-shadow"></div>
+          </div>
+        </header>
+
+        <div id="view-root" class="clean-scroll flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-4 md:gap-5 md:p-6">
+          <section id="focus-zone" class="mx-auto hidden w-full max-w-6xl min-h-[30vh] flex items-center justify-center lg:min-h-0 lg:flex-[3]"></section>
+          <section id="columns" class="mx-auto grid w-full max-w-6xl grid-cols-1 gap-4 lg:min-h-0 lg:flex-[7] lg:grid-cols-3"></section>
+          <div id="list-view" class="clean-scroll hidden min-h-0 flex-1 overflow-y-auto"></div>
+        </div>
+      </main>
+    </div>
   </div>
 
   <!-- ============ MODALS (filled by app.js) ============ -->
@@ -348,6 +411,10 @@
   <div id="history-modal" class="modal-backdrop fixed inset-0 z-40 hidden items-center justify-center p-4"></div>
   <div id="archive-modal" class="modal-backdrop fixed inset-0 z-40 hidden items-center justify-center p-4"></div>
   <div id="boards-modal" class="modal-backdrop fixed inset-0 z-40 hidden items-center justify-center p-4"></div>
+  <div id="task-modal" class="modal-backdrop fixed inset-0 z-40 hidden items-center justify-center p-4"></div>
+  <div id="filter-modal" class="modal-backdrop fixed inset-0 z-40 hidden items-center justify-center p-4"></div>
+  <div id="pomodoro-modal" class="modal-backdrop fixed inset-0 z-40 hidden items-center justify-center p-4"></div>
+  <div id="habit-modal" class="modal-backdrop fixed inset-0 z-40 hidden items-center justify-center p-4"></div>
   <div id="recovery-modal" class="modal-backdrop fixed inset-0 z-50 hidden items-center justify-center p-4"></div>
   <div id="help-modal"     class="modal-backdrop fixed inset-0 z-40 hidden items-center justify-center p-4"></div>
 

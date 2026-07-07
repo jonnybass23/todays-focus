@@ -46,6 +46,25 @@ let settings = { theme: 'dark', timezone: '' };
 let currentUser = null;
 let boards = [];
 let currentBoard = null;
+let allCards = [];                     // every active card across boards (smart views + sidebar counts)
+let currentView = { kind: 'board' };   // 'board' | 'today' | 'upcoming' | 'all' | 'tag' | 'search' | ...
+let activeTag = null;
+let searchQuery = '';
+let listSort = (() => { try { return localStorage.getItem('tf-sort') || 'smart'; } catch (_) { return 'smart'; } })();
+let savedFilters = [];                   // user's saved smart-list filters
+let activeFilter = null;                 // the filter object currently applied (view kind 'filter')
+let habits = [];                         // habit definitions
+let habitCheckins = new Set();           // "habitId|YYYY-MM-DD" for each completed day
+let focusViewOn = (() => { try { return localStorage.getItem('tf-focusview') !== '0'; } catch (_) { return true; } })(); // Focus Zone shown by default
+let calCursor = null;                   // first-of-month Date shown in the Calendar view
+let journalDay = null;                   // YYYY-MM-DD open in the Journal
+let journalCursor = null;                // month shown in the Journal mini-calendar
+let journalDays = new Set();             // days that have an entry (for calendar dots)
+let journalEntries = [];                 // [{day, mood, snippet}] for the entries list
+let journalShowAll = false;              // entries list: show all vs last 10
+let journalCurMood = '';                 // mood emoji for the open day
+let journalSaveTimer = null;
+let pushState = { supported: false, enabled: false, publicKey: '' };
 let authConfig = { needsBootstrap: false, openRegistration: false, inviteCodeSet: false };
 let authMode = 'login';
 let pollTimer = null;
@@ -133,10 +152,12 @@ async function enterApp() {
   renderStreak();
   setDate();
   try { await loadBoards(); } catch (err) { handleApiError(err); return; }
-  buildBoard();
-  renderBoardSwitcher();
-  loadCards();
-  if (currentBoard) touchBoard(currentBoard.id);
+  await loadActive();
+  await loadFilters();
+  await loadHabits();
+  renderQuickAdd();
+  initPush();
+  restoreView();
   startPolling();
 }
 function setAuthMode(mode) {
@@ -184,7 +205,7 @@ async function submitAuth(e) {
 async function logout() { try { await request('/auth/logout', { method: 'POST' }); } catch (_) {} forceReauth(); }
 function forceReauth() {
   stopPolling(); currentUser = null; state.cards = []; boards = []; currentBoard = null;
-  ['#account-modal', '#admin-modal', '#history-modal', '#archive-modal', '#boards-modal', '#help-modal'].forEach(closeModal);
+  ['#account-modal', '#admin-modal', '#history-modal', '#archive-modal', '#boards-modal', '#task-modal', '#filter-modal', '#pomodoro-modal', '#habit-modal', '#help-modal'].forEach(closeModal);
   request('/auth/config').then((c) => { authConfig = c; }).catch(() => {}).finally(() => setAuthMode('login'));
   showScreen('auth');
 }
@@ -200,43 +221,17 @@ async function loadBoards() {
   if (currentBoard) { try { localStorage.setItem('tf-board', currentBoard.id); } catch (_) {} }
 }
 function selectBoard(id) {
-  const b = boards.find((x) => x.id === id);
-  if (!b || (currentBoard && b.id === currentBoard.id)) return;
-  currentBoard = b;
-  try { localStorage.setItem('tf-board', id); } catch (_) {}
-  ui.composer = null; ui.editingLabel = null; ui.editingCard = null; ui.editingSubtask = null; ui.subtaskAdding = null;
-  buildBoard(); renderBoardSwitcher(); loadCards(); touchBoard(id);
+  if (currentView.kind === 'board' && currentBoard && id === currentBoard.id) return;
+  openBoard(id);
 }
 // Mark a board as just-used so it sorts to the top of the dropdown (Today's Focus stays pinned).
 async function touchBoard(id) {
   try { const { boards: bs } = await request('/boards/' + id + '/touch', { method: 'POST' }); boards = bs; renderBoardSwitcher(); }
   catch (_) {}
 }
-function renderBoardSwitcher() {
-  const wrap = $('#board-switcher');
-  if (!wrap) return;
-  wrap.innerHTML = '';
-  const btn = el('button', 'flex items-center gap-2 rounded-lg px-2 py-1.5 text-sm font-semibold text-ink transition hover:bg-edge');
-  btn.append(el('span', 'text-base leading-none', currentBoard ? currentBoard.icon : '🎯'), el('span', 'max-w-[12rem] truncate', currentBoard ? currentBoard.name : "Today's Focus"));
-  const chev = el('span', 'text-ink-faint'); chev.innerHTML = CHEV_SVG; btn.append(chev);
-
-  const menu = el('div', 'absolute left-0 top-full z-30 mt-2 hidden w-64 overflow-hidden rounded-xl border border-edge bg-panel py-1 text-sm themed-shadow');
-  boards.forEach((b) => {
-    const active = currentBoard && b.id === currentBoard.id;
-    const it = el('button', `flex w-full items-center gap-2 px-3 py-2 text-left transition hover:bg-edge ${active ? 'text-ink' : 'text-ink-soft'}`);
-    it.append(el('span', 'text-base leading-none', b.icon), el('span', 'flex-1 truncate', b.name));
-    if (b.streak) { const f = el('span', 'text-ink-faint'); f.innerHTML = FLAME_SVG; it.append(f); }
-    it.addEventListener('click', () => { menu.classList.add('hidden'); selectBoard(b.id); });
-    menu.append(it);
-  });
-  menu.append(el('div', 'my-1 border-t border-edge'));
-  const action = (label, fn) => { const b = el('button', 'flex w-full items-center px-3 py-2 text-left text-ink-soft transition hover:bg-edge hover:text-ink', label); b.addEventListener('click', () => { menu.classList.add('hidden'); fn(); }); return b; };
-  menu.append(action('＋  New board', () => openBoardEditor(null)), action('⚙  Manage boards', openBoardsModal));
-
-  btn.addEventListener('click', (e) => { e.stopPropagation(); menu.classList.toggle('hidden'); });
-  document.addEventListener('click', (e) => { if (!wrap.contains(e.target)) menu.classList.add('hidden'); });
-  wrap.append(btn, menu);
-}
+// The old top-left dropdown is now the sidebar; keep this name as a thin alias
+// so existing call-sites (board create/edit/delete, touch) refresh the sidebar.
+function renderBoardSwitcher() { renderSidebar(); }
 
 function openBoardsModal() {
   const modal = $('#boards-modal'); modal.innerHTML = '';
@@ -311,7 +306,7 @@ function openBoardEditor(board) {
       const result = board ? await request('/boards/' + board.id, { method: 'PATCH', body: JSON.stringify(payload) }) : await request('/boards', { method: 'POST', body: JSON.stringify(payload) });
       boards = result.boards; currentBoard = result.board;
       try { localStorage.setItem('tf-board', currentBoard.id); } catch (_) {}
-      closeModal('#boards-modal'); buildBoard(); renderBoardSwitcher(); loadCards();
+      closeModal('#boards-modal'); buildBoard(); setView({ kind: 'board', boardId: currentBoard.id }); loadCards();
       toast(board ? 'Board updated' : 'Board created');
     } catch (e) { showErr(e.message); }
   });
@@ -333,7 +328,7 @@ function openBoardEditor(board) {
         const { boards: bs } = await request('/boards/' + board.id, { method: 'DELETE' });
         boards = bs;
         if (!currentBoard || currentBoard.id === board.id) { currentBoard = boards[0]; try { localStorage.setItem('tf-board', currentBoard.id); } catch (_) {} }
-        closeModal('#boards-modal'); buildBoard(); renderBoardSwitcher(); loadCards(); toast('Board deleted');
+        closeModal('#boards-modal'); buildBoard(); setView({ kind: 'board', boardId: currentBoard.id }); loadCards(); toast('Board deleted');
       } catch (e) { handleApiError(e); }
     });
     panel.append(del);
@@ -488,17 +483,19 @@ async function loadArchive(listWrap) {
 function renderUserMenu() {
   const wrap = $('#user-menu'); if (!wrap || !currentUser) return;
   wrap.innerHTML = '';
-  const btn = el('button', 'flex items-center gap-2 rounded-full border border-edge bg-panel px-3 py-1.5 text-xs font-medium text-ink-soft transition hover:text-ink themed-shadow');
-  const dot = el('span', 'grid h-5 w-5 place-items-center rounded-full text-[10px] font-bold'); dot.style.background = 'var(--accent)'; dot.style.color = 'var(--bg)'; dot.textContent = (currentUser.username[0] || '?').toUpperCase();
-  btn.append(dot, el('span', 'max-w-[10rem] truncate', currentUser.username));
-  const menu = el('div', 'absolute right-0 top-full z-30 mt-2 hidden w-44 overflow-hidden rounded-xl border border-edge bg-panel py-1 text-sm themed-shadow');
+  const btn = el('button', 'flex w-full items-center gap-2.5 rounded-lg px-2 py-2 text-sm font-medium text-ink-soft transition hover:bg-edge hover:text-ink');
+  const dot = el('span', 'grid h-6 w-6 shrink-0 place-items-center rounded-full text-[11px] font-bold'); dot.style.background = 'var(--accent)'; dot.style.color = 'var(--bg)'; dot.textContent = (currentUser.username[0] || '?').toUpperCase();
+  btn.append(dot, el('span', 'flex-1 truncate text-left', currentUser.username));
+  const chev = el('span', 'shrink-0 text-ink-faint'); chev.innerHTML = CHEV_SVG; chev.style.transform = 'rotate(180deg)'; btn.append(chev);
+  const menu = el('div', 'absolute bottom-full left-0 z-30 mb-2 hidden w-full min-w-[11rem] overflow-hidden rounded-xl border border-edge bg-panel py-1 text-sm themed-shadow');
   const item = (label, onClick, danger) => { const b = el('button', `flex w-full items-center px-3 py-2 text-left transition hover:bg-edge ${danger ? 'text-red-400' : 'text-ink'}`, label); b.addEventListener('click', () => { menu.classList.add('hidden'); onClick(); }); return b; };
   const themeSection = el('div', 'flex md:hidden items-center justify-center gap-1 border-b border-edge px-2 py-2');
   THEMES.forEach((t) => { const active = settings.theme === t.id; const b = el('button', `grid h-7 w-7 place-items-center rounded-full text-xs transition ${active ? 'btn-accent' : 'text-ink-soft hover:text-ink'}`); b.type = 'button'; b.title = `${t.label} theme`; b.innerHTML = ICONS[t.id] || ''; b.addEventListener('click', () => { setTheme(t.id); renderUserMenu(); }); themeSection.append(b); });
   menu.append(themeSection);
   if (currentUser.role === 'admin') menu.append(el('div', 'px-3 pb-1 pt-1 text-[10px] font-semibold uppercase tracking-wider text-ink-faint', 'Admin'), item('Manage users', openAdminModal));
   if (shopConfig && shopConfig.enabled && shopConfig.url) menu.append(item(shopConfig.label || 'Get the 3D-printed version', () => window.open(shopConfig.url, '_blank', 'noopener')));
-  menu.append(item('Focus history', openHistoryModal), item('Archive', openArchiveModal), item('Help & tips', openHelpModal), item('Account & API token', openAccountModal), item('Log out', logout, true));
+  if (pushState.supported) menu.append(item(pushState.enabled ? '🔔  Reminders on ✓' : '🔔  Enable reminders', pushState.enabled ? disableReminders : enableReminders));
+  menu.append(item('Focus history', openHistoryModal), item('Completed & archive', openArchiveModal), item('Help & tips', openHelpModal), item('Account & API token', openAccountModal), item('Log out', logout, true));
   btn.addEventListener('click', (e) => { e.stopPropagation(); menu.classList.toggle('hidden'); });
   document.addEventListener('click', (e) => { if (!wrap.contains(e.target)) menu.classList.add('hidden'); });
   wrap.append(btn, menu);
@@ -696,7 +693,8 @@ function buildBoard() {
   const wrap = $('#columns'); wrap.innerHTML = ''; refs = { columns: {} }; seenCards = new Set(); expandedCards = new Set();
   const cols = boardCols();
   const n = Math.min(Math.max(cols.length, 1), 4);
-  wrap.className = `grid min-h-0 flex-[7] grid-cols-1 gap-4 md:grid-cols-${n}`;
+  // Equal columns that fill the same set width as the Focus Zone above, and stack below lg (so columns never get too narrow to read).
+  wrap.className = `mx-auto grid w-full max-w-6xl grid-cols-1 gap-4 lg:min-h-0 lg:flex-[7] lg:grid-cols-${n}`;
   cols.forEach((col) => {
     const section = el('section', 'themed-shadow flex min-h-0 flex-col overflow-hidden rounded-2xl border border-edge bg-panel');
     const header = el('header', 'flex items-center justify-between gap-2 border-b border-edge px-4 py-3');
@@ -709,7 +707,7 @@ function buildBoard() {
     addBtn.textContent = '+'; addBtn.title = 'Add a card'; addBtn.addEventListener('click', () => toggleComposer(col.key));
     header.append(left, addBtn);
     const composer = el('div', 'hidden px-3 pt-3');
-    const body = el('div', 'clean-scroll flex-1 space-y-2 overflow-y-auto p-3 max-h-[55vh] md:max-h-none');
+    const body = el('div', 'clean-scroll flex-1 space-y-2 overflow-y-auto p-3 max-h-[55vh] lg:max-h-none');
     body.dataset.dropzone = 'column'; body.dataset.type = col.key;
     attachColumnSortable(body, col.key);
     section.append(header, composer, body); wrap.appendChild(section);
@@ -717,7 +715,7 @@ function buildBoard() {
   });
   renderLabels();
 }
-function render() { renderFocus(); boardCols().forEach(renderColumn); }
+function render() { renderFocus(); boardCols().forEach(renderColumn); if (currentView.kind === 'board') $('#view-count').textContent = state.cards.length ? String(state.cards.length) : ''; }
 function renderFocus() {
   const zone = $('#focus-zone');
   const flabel = (currentBoard && currentBoard.focusLabel) || 'Focus';
@@ -800,6 +798,17 @@ function cardEl(card) {
     const subs = subtasksOf(card);
     const hasSubs = subs.length > 0;
     const text = el('p', 'pr-14 leading-snug break-words'); text.textContent = card.title; node.appendChild(text);
+
+    // due / tags / recur meta
+    if (card.dueAt || (card.tags && card.tags.length) || card.recur || card.duration || card.note) {
+      const meta = el('div', 'mt-1.5 flex flex-wrap items-center gap-1.5 pr-10');
+      if (card.dueAt) { const p = el('span', 'due-pill ' + dueClass(card.dueAt)); p.innerHTML = CLOCK_SVG; p.append(el('span', '', formatDue(card.dueAt))); meta.append(p); }
+      (card.tags || []).forEach((t) => meta.append(el('span', 'tag-chip', '#' + t)));
+      if (card.recur) meta.append(el('span', 'tag-chip', '🔁'));
+      if (card.duration) meta.append(el('span', 'tag-chip', '⏱ ' + fmtDur(card.duration)));
+      if (card.note) { const nn = el('span', 'tag-chip', '📝'); nn.title = 'Has notes'; meta.append(nn); }
+      node.appendChild(meta);
+    }
 
     const actions = el('div', 'absolute right-1.5 top-1.5 flex items-center gap-0.5');
     // subtasks show/hide toggle — always visible when there are subtasks, so they're discoverable
@@ -1092,6 +1101,7 @@ function openCardMenu(card, anchorEl, opts = {}) {
   });
   menu.appendChild(pRow);
   addItem(PENCIL_SVG, 'Edit text', '', () => { ui.editingCard = card.id; render(); });
+  addItem(CLOCK_SVG, 'Details · due · tags', '', () => openTaskModal(card));
   if (opts.multiBoard) addItem(MOVE_SVG, 'Move to board', '', () => openMoveMenu(card, anchorEl));
   addItem(TRASH_SVG, 'Archive', 'text-red-400 hover:text-red-300', () => archiveCard(card.id));
   document.body.appendChild(menu);
@@ -1152,6 +1162,931 @@ function initDragTracking() {
   document.addEventListener('dragend', (e) => { const node = e.target.closest && e.target.closest('[data-card-id]'); if (node) node.classList.remove('dragging'); ui.draggingId = null; $$('.drag-over').forEach((n) => n.classList.remove('drag-over')); if (currentUser && currentBoard) render(); });
 }
 
+// ============================================================
+// TICKTICK-STYLE LAYER — smart views, sidebar, due dates, tags,
+// quick-add parsing, task detail editor, and push reminders.
+// ============================================================
+const CLOCK_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="h-3 w-3"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>';
+const PRIORITY_HEX = ['', '#60a5fa', '#fbbf24', '#f87171'];
+const PRIORITY_LABEL = ['None', 'Low', 'Medium', 'High'];
+const priorityColor = (p) => PRIORITY_HEX[p] || null;
+
+// ---- date helpers (device-local) ----
+function dayStart(d) { const x = new Date(d); x.setHours(0, 0, 0, 0); return x; }
+const todayStart = () => dayStart(new Date());
+const hasTimeOf = (iso) => { const d = new Date(iso); return !Number.isNaN(d.getTime()) && !(d.getHours() === 0 && d.getMinutes() === 0); };
+function formatDue(iso) {
+  const d = new Date(iso); if (Number.isNaN(d.getTime())) return '';
+  const now = new Date();
+  const days = Math.round((dayStart(d) - todayStart()) / 86400000);
+  const time = hasTimeOf(iso) ? d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : '';
+  let day;
+  if (days === 0) day = 'Today';
+  else if (days === 1) day = 'Tomorrow';
+  else if (days === -1) day = 'Yesterday';
+  else if (days > 1 && days < 7) day = d.toLocaleDateString([], { weekday: 'short' });
+  else day = d.toLocaleDateString([], { day: 'numeric', month: 'short', ...(d.getFullYear() !== now.getFullYear() ? { year: 'numeric' } : {}) });
+  return time ? `${day} ${time}` : day;
+}
+function dueClass(iso) {
+  if (!iso) return '';
+  const d = new Date(iso); if (Number.isNaN(d.getTime())) return '';
+  const t = todayStart().getTime(), dd = dayStart(d).getTime();
+  if (dd < t) return 'overdue';
+  if (dd > t) return '';
+  return (hasTimeOf(iso) && d.getTime() < Date.now()) ? 'overdue' : 'today';
+}
+const dueSortKey = (c) => (c.dueAt ? new Date(c.dueAt).getTime() : Number.MAX_SAFE_INTEGER);
+function fmtDur(m) { m = Math.round(m || 0); if (!m) return ''; const h = Math.floor(m / 60), mm = m % 60; return h ? (mm ? `${h}h ${mm}m` : `${h}h`) : `${mm}m`; }
+function sorterFor(mode) {
+  const byCreated = (a, b) => (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0);
+  switch (mode) {
+    case 'due': return (a, b) => (dueSortKey(a) - dueSortKey(b)) || byCreated(a, b);
+    case 'priority': return (a, b) => ((b.priority || 0) - (a.priority || 0)) || (dueSortKey(a) - dueSortKey(b));
+    case 'created': return byCreated;
+    case 'alpha': return (a, b) => a.title.localeCompare(b.title);
+    default: return (a, b) => (dueSortKey(a) - dueSortKey(b)) || ((b.priority || 0) - (a.priority || 0)) || byCreated(a, b);
+  }
+}
+
+// ---- quick-add natural-language parser ----
+function parseQuickAdd(raw) {
+  let text = ' ' + String(raw || '').trim() + ' ';
+  const tags = [];
+  text = text.replace(/\s#([\p{L}0-9_-]{1,30})/gu, (_, t) => { tags.push(t.toLowerCase()); return ' '; });
+  let priority = 0;
+  const pm = text.match(/\s(!{1,3})(?=\s)/);
+  if (pm) { priority = Math.min(3, pm[1].length); text = text.replace(pm[0], ' '); }
+  let recur = '';
+  const rec = text.match(/\severy\s+(day|weekday|week|month|year|2\s*weeks|fortnight)\b/i);
+  if (rec) { recur = { day: 'daily', weekday: 'weekday', week: 'weekly', month: 'monthly', year: 'yearly', '2weeks': 'biweekly', fortnight: 'biweekly' }[rec[1].toLowerCase().replace(/\s+/g, '')] || ''; text = text.replace(rec[0], ' '); }
+  const nd = parseNaturalDate(text);
+  text = nd.cleaned;
+  const title = text.replace(/\s+/g, ' ').trim();
+  return { title, dueAt: nd.dueAt, tags, priority, recur };
+}
+function parseNaturalDate(text) {
+  let cleaned = text;
+  const now = new Date();
+  let base = null;
+  const strip = (re) => { cleaned = cleaned.replace(re, ' '); };
+  if (/\btoday\b/i.test(text)) { base = todayStart(); strip(/\btoday\b/i); }
+  else if (/\btonight\b/i.test(text)) { base = todayStart(); strip(/\btonight\b/i); }
+  else if (/\b(tomorrow|tmr|tmrw)\b/i.test(text)) { const d = todayStart(); d.setDate(d.getDate() + 1); base = d; strip(/\b(tomorrow|tmr|tmrw)\b/i); }
+  else if (/\bnext week\b/i.test(text)) { const d = todayStart(); d.setDate(d.getDate() + 7); base = d; strip(/\bnext week\b/i); }
+  if (!base) {
+    const wd = text.match(/\b(next\s+)?(monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun)\b/i);
+    if (wd) {
+      const map = { sun: 0, mon: 1, tue: 2, tues: 2, wed: 3, thu: 4, thur: 4, thurs: 4, fri: 5, sat: 6, sunday: 0, monday: 1, tuesday: 2, wednesday: 3, thursday: 4, friday: 5, saturday: 6 };
+      const target = map[wd[2].toLowerCase()];
+      const d = todayStart(); let add = (target - d.getDay() + 7) % 7; if (add === 0) add = 7;
+      d.setDate(d.getDate() + add); base = d; cleaned = cleaned.replace(wd[0], ' ');
+    }
+  }
+  let hh = null, mm = 0;
+  const t = text.match(/\b(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/i) || text.match(/\bat\s+(\d{1,2})(?::(\d{2}))?\b/i);
+  if (t) {
+    hh = parseInt(t[1], 10); mm = t[2] ? parseInt(t[2], 10) : 0;
+    const ap = (t[3] || '').toLowerCase();
+    if (ap === 'pm' && hh < 12) hh += 12; if (ap === 'am' && hh === 12) hh = 0;
+    if (hh >= 0 && hh < 24 && mm < 60) cleaned = cleaned.replace(t[0], ' '); else hh = null;
+  }
+  if (hh === null && /\bnoon\b/i.test(text)) { hh = 12; strip(/\bnoon\b/i); }
+  if (hh === null && /\btonight\b/i.test(text)) hh = 20;
+  if (base === null && hh === null) return { dueAt: null, cleaned };
+  const d = base ? new Date(base) : todayStart();
+  if (hh !== null) d.setHours(hh, mm, 0, 0);
+  if (base === null && hh !== null && d.getTime() < Date.now()) d.setDate(d.getDate() + 1);
+  return { dueAt: d.toISOString(), cleaned };
+}
+
+// ---- active-card cache (all boards) ----
+async function loadActive() { try { const { cards } = await request('/active'); allCards = cards; } catch (err) { handleApiError(err); } }
+async function loadFilters() { try { const { filters } = await request('/filters'); savedFilters = filters || []; } catch (_) { savedFilters = []; } }
+
+// ---- view routing ----
+function openBoard(id) {
+  const b = boards.find((x) => x.id === id) || currentBoard || boards[0];
+  if (!b) return;
+  currentBoard = b; try { localStorage.setItem('tf-board', b.id); } catch (_) {}
+  ui.composer = null; ui.editingLabel = null; ui.editingCard = null; ui.editingSubtask = null; ui.subtaskAdding = null;
+  buildBoard();
+  setView({ kind: 'board', boardId: b.id });
+  loadCards();
+  touchBoard(b.id);
+}
+function setView(view) {
+  currentView = view;
+  try { if (view.kind !== 'search') localStorage.setItem('tf-view', JSON.stringify(view)); } catch (_) {}
+  closeSidebarDrawer();
+  applyViewLayout();
+  renderHeaderForView();
+  renderSidebar();
+  if (view.kind === 'board') render(); else renderListView();
+}
+function restoreView() {
+  let saved = null; try { saved = JSON.parse(localStorage.getItem('tf-view') || 'null'); } catch (_) {}
+  if (saved && saved.kind && saved.kind !== 'board') {
+    if (saved.kind === 'tag') activeTag = saved.tag;
+    if (saved.kind === 'filter') { const f = savedFilters.find((x) => x.id === saved.id); if (!f) { openBoard(currentBoard ? currentBoard.id : (boards[0] && boards[0].id)); return; } activeFilter = f; }
+    setView(saved); return;
+  }
+  openBoard(currentBoard ? currentBoard.id : (boards[0] && boards[0].id));
+}
+function applyViewLayout() {
+  const board = currentView.kind === 'board';
+  $('#list-view').classList.toggle('hidden', board);
+  $('#columns').classList.toggle('hidden', !board);
+  const showFocus = board && (isSpotlight() || focusViewOn);
+  $('#focus-zone').classList.toggle('hidden', !showFocus);
+  const ft = $('#focus-toggle');
+  ft.classList.toggle('hidden', !board || isSpotlight());
+  ft.classList.toggle('btn-accent', showFocus && !isSpotlight());
+}
+function viewMeta() {
+  switch (currentView.kind) {
+    case 'focuses': return { icon: '🎯', title: 'In Focus' };
+    case 'today': return { icon: '📅', title: 'Today' };
+    case 'upcoming': return { icon: '🗓️', title: 'Next 7 days' };
+    case 'calendar': return { icon: '📆', title: 'Calendar' };
+    case 'matrix': return { icon: '🔲', title: 'Priority Matrix' };
+    case 'habits': return { icon: '🌱', title: 'Habits' };
+    case 'journal': return { icon: '📓', title: 'Journal' };
+    case 'all': return { icon: '🗂️', title: 'All tasks' };
+    case 'tag': return { icon: '#', title: activeTag || '' };
+    case 'search': return { icon: '🔍', title: searchQuery ? `“${searchQuery}”` : 'Search' };
+    case 'filter': return { icon: '⚡', title: (activeFilter && activeFilter.name) || 'Filter' };
+    default: return { icon: currentBoard ? currentBoard.icon : '🎯', title: currentBoard ? currentBoard.name : "Today's Focus" };
+  }
+}
+// The current focus of a board: its focused card, or the daily spotlight pick for "of the day" boards.
+function boardFocus(bd) {
+  const cards = allCards.filter((c) => c.boardId === bd.id);
+  return bd.spotlight ? spotlightPick(cards) : cards.find((c) => c.focused);
+}
+function renderHeaderForView() { const m = viewMeta(); $('#view-icon').textContent = m.icon; $('#view-title').textContent = m.title; }
+function renderCurrentView() { if (currentView.kind === 'board') render(); else renderListView(); }
+
+// ---- sidebar ----
+function renderSidebar() { renderSmartViews(); renderProjects(); renderFilters(); renderTags(); }
+function renderFilters() {
+  const nav = $('#sidebar-filters'); if (!nav) return; nav.innerHTML = '';
+  if (!savedFilters.length) { nav.append(el('div', 'px-2 py-1 text-[11px] text-ink-faint', 'No filters yet — tap +')); return; }
+  savedFilters.forEach((f) => {
+    const row = el('div', 'group/f flex items-center');
+    const active = currentView.kind === 'filter' && activeFilter && activeFilter.id === f.id;
+    const b = el('button', 'nav-item flex-1' + (active ? ' active' : ''));
+    b.append(el('span', 'text-base leading-none', '⚡'), el('span', 'flex-1 truncate', f.name));
+    const cnt = filterCards(f).length; if (cnt) b.append(el('span', 'nav-count', String(cnt)));
+    b.addEventListener('click', () => { activeFilter = f; setView({ kind: 'filter', id: f.id }); });
+    const edit = el('button', 'ml-1 hidden shrink-0 rounded p-1 text-ink-faint transition hover:text-ink group-hover/f:block', '✎');
+    edit.title = 'Edit filter'; edit.addEventListener('click', (e) => { e.stopPropagation(); openFilterEditor(f); });
+    row.append(b, edit); nav.append(row);
+  });
+}
+function openFilterEditor(filter) {
+  const modal = $('#filter-modal'); modal.innerHTML = '';
+  const panel = modalShell(filter ? 'Edit filter' : 'New filter', () => closeModal('#filter-modal')); panel.classList.add('max-w-md');
+  const draft = filter ? { ...filter, tags: (filter.tags || []).slice(), boards: (filter.boards || []).slice() } : { id: null, name: '', tags: [], priority: 0, due: 'any', boards: [] };
+
+  const name = el('input', 'field'); name.placeholder = 'Filter name'; name.value = draft.name;
+  name.addEventListener('input', () => { draft.name = name.value; });
+  const tagsWrap = el('div', 'mt-3'); tagsWrap.append(el('label', 'mb-1 block text-xs text-ink-soft', 'Tags — all must match'));
+  const tagIn = el('input', 'field'); tagIn.value = draft.tags.join(' '); tagIn.placeholder = 'merlin work';
+  tagIn.addEventListener('input', () => { draft.tags = tagIn.value.split(/[\s,]+/).map((t) => t.replace(/^#/, '').toLowerCase()).filter(Boolean); });
+  tagsWrap.append(tagIn);
+  const prioWrap = el('div', 'mt-3'); prioWrap.append(el('label', 'mb-1 block text-xs text-ink-soft', 'Minimum priority'));
+  const prioSel = el('select', 'field'); [['0', 'Any'], ['1', 'Low or higher'], ['2', 'Medium or higher'], ['3', 'High only']].forEach(([v, l]) => { const o = el('option', '', l); o.value = v; prioSel.append(o); }); prioSel.value = String(draft.priority);
+  prioSel.addEventListener('change', () => { draft.priority = parseInt(prioSel.value, 10); }); prioWrap.append(prioSel);
+  const dueWrap = el('div', 'mt-3'); dueWrap.append(el('label', 'mb-1 block text-xs text-ink-soft', 'Due'));
+  const dueSel = el('select', 'field'); [['any', 'Any time'], ['overdue', 'Overdue'], ['today', 'Today or earlier'], ['week', 'Within 7 days']].forEach(([v, l]) => { const o = el('option', '', l); o.value = v; dueSel.append(o); }); dueSel.value = draft.due;
+  dueSel.addEventListener('change', () => { draft.due = dueSel.value; }); dueWrap.append(dueSel);
+  const boardsWrap = el('div', 'mt-3'); boardsWrap.append(el('label', 'mb-1 block text-xs text-ink-soft', 'Projects — any of (blank = all)'));
+  const boardsBox = el('div', 'clean-scroll max-h-40 space-y-1 overflow-y-auto rounded-lg border border-edge p-2');
+  boards.forEach((bd) => {
+    const row = el('label', 'flex cursor-pointer items-center gap-2 text-sm text-ink');
+    const cb = el('input', ''); cb.type = 'checkbox'; cb.checked = draft.boards.includes(bd.id);
+    cb.addEventListener('change', () => { if (cb.checked) { if (!draft.boards.includes(bd.id)) draft.boards.push(bd.id); } else draft.boards = draft.boards.filter((x) => x !== bd.id); });
+    row.append(cb, el('span', '', bd.icon + ' ' + bd.name)); boardsBox.append(row);
+  });
+  boardsWrap.append(boardsBox);
+  const err = el('p', 'mt-2 hidden text-xs text-red-400');
+  const save = el('button', 'btn-accent mt-4 w-full rounded-lg px-4 py-2 text-sm font-semibold transition hover:opacity-90', 'Save filter');
+  save.addEventListener('click', async () => {
+    if (!draft.name.trim()) { err.textContent = 'Give the filter a name.'; err.classList.remove('hidden'); return; }
+    const f = { id: draft.id || newId(), name: draft.name.trim(), tags: draft.tags, priority: draft.priority, due: draft.due, boards: draft.boards };
+    const next = draft.id ? savedFilters.map((x) => (x.id === draft.id ? f : x)) : savedFilters.concat(f);
+    try { const { filters } = await request('/filters', { method: 'PUT', body: JSON.stringify({ filters: next }) }); savedFilters = filters; closeModal('#filter-modal'); activeFilter = savedFilters.find((x) => x.id === f.id) || f; setView({ kind: 'filter', id: f.id }); toast('Filter saved'); }
+    catch (e) { err.textContent = e.message; err.classList.remove('hidden'); }
+  });
+  panel.append(el('label', 'mb-1 block text-xs text-ink-soft', 'Name'), name, tagsWrap, prioWrap, dueWrap, boardsWrap, err, save);
+  if (filter) {
+    const del = el('button', 'mt-2 w-full rounded-lg border border-edge px-4 py-2 text-sm font-medium text-red-400 transition hover:bg-edge', 'Delete filter');
+    del.addEventListener('click', async () => {
+      const next = savedFilters.filter((x) => x.id !== filter.id);
+      try { const { filters } = await request('/filters', { method: 'PUT', body: JSON.stringify({ filters: next }) }); savedFilters = filters; closeModal('#filter-modal'); if (currentView.kind === 'filter' && activeFilter && activeFilter.id === filter.id) setView({ kind: 'today' }); else renderSidebar(); toast('Filter deleted'); }
+      catch (e) { handleApiError(e); }
+    });
+    panel.append(del);
+  }
+  modal.append(panel); openModal('#filter-modal');
+}
+function renderQuickAdd() {
+  const wrap = $('#quick-add'); if (!wrap) return; wrap.innerHTML = '';
+  const form = el('form', 'relative');
+  const input = el('input', 'field'); input.placeholder = '+ Add task'; input.title = 'Try: Email Steve tomorrow 3pm #merlin !!'; input.maxLength = MAX_TITLE_LEN; input.autocomplete = 'off';
+  form.addEventListener('submit', (e) => { e.preventDefault(); const v = input.value; input.value = ''; quickAdd(v); });
+  form.append(input); wrap.append(form);
+}
+async function quickAdd(raw) {
+  const p = parseQuickAdd(raw); if (!p.title) return;
+  const boardId = (currentView.kind === 'board' && currentBoard) ? currentBoard.id : ((boards.find((b) => b.pinned) || boards[0] || {}).id);
+  const payload = { title: p.title, boardId, tags: p.tags, priority: p.priority, recur: p.recur };
+  if (p.dueAt) { payload.dueAt = p.dueAt; if (hasTimeOf(p.dueAt)) payload.remindAt = p.dueAt; }
+  try {
+    await request('/cards', { method: 'POST', body: JSON.stringify(payload) });
+    await loadActive();
+    if (currentBoard && boardId === currentBoard.id) await loadCards();
+    renderCurrentView(); renderSidebar();
+    toast(p.dueAt ? `Added · due ${formatDue(p.dueAt)}` : 'Added ✓');
+  } catch (err) { handleApiError(err); }
+}
+function renderSmartViews() {
+  const nav = $('#smart-views'); if (!nav) return; nav.innerHTML = '';
+  const end = todayStart(); end.setDate(end.getDate() + 7);
+  const todayN = allCards.filter((c) => c.dueAt && dayStart(new Date(c.dueAt)) <= todayStart()).length;
+  const upN = allCards.filter((c) => c.dueAt && dayStart(new Date(c.dueAt)) <= end).length;
+  const focusN = boards.reduce((n, bd) => n + (boardFocus(bd) ? 1 : 0), 0);
+  [
+    { kind: 'focuses', icon: '🎯', label: 'In Focus', count: focusN },
+    { kind: 'today', icon: '📅', label: 'Today', count: todayN },
+    { kind: 'upcoming', icon: '🗓️', label: 'Next 7 days', count: upN },
+    { kind: 'calendar', icon: '📆', label: 'Calendar' },
+    { kind: 'matrix', icon: '🔲', label: 'Priority Matrix' },
+    { kind: 'habits', icon: '🌱', label: 'Habits' },
+    { kind: 'journal', icon: '📓', label: 'Journal' },
+    { kind: 'all', icon: '🗂️', label: 'All tasks', count: allCards.length },
+  ].forEach((it) => {
+    const b = el('button', 'nav-item' + (currentView.kind === it.kind ? ' active' : ''));
+    b.append(el('span', 'text-base leading-none', it.icon), el('span', 'flex-1 truncate', it.label));
+    if (it.count) b.append(el('span', 'nav-count', String(it.count)));
+    b.addEventListener('click', () => setView({ kind: it.kind }));
+    nav.append(b);
+  });
+}
+function renderProjects() {
+  const nav = $('#sidebar-projects'); if (!nav) return; nav.innerHTML = '';
+  boards.forEach((bd) => {
+    const active = currentView.kind === 'board' && currentBoard && currentBoard.id === bd.id;
+    const b = el('button', 'nav-item' + (active ? ' active' : ''));
+    b.append(el('span', 'text-base leading-none', bd.icon), el('span', 'flex-1 truncate', bd.name));
+    const cnt = allCards.filter((c) => c.boardId === bd.id).length;
+    if (bd.streak) { const f = el('span', 'text-ink-faint'); f.innerHTML = FLAME_SVG; b.append(f); }
+    else if (cnt) b.append(el('span', 'nav-count', String(cnt)));
+    b.addEventListener('click', () => openBoard(bd.id));
+    nav.append(b);
+  });
+  const manage = el('button', 'nav-item text-ink-faint');
+  manage.append(el('span', 'text-base leading-none', '⚙'), el('span', 'flex-1 truncate', 'Manage projects'));
+  manage.addEventListener('click', openBoardsModal); nav.append(manage);
+}
+function renderTags() {
+  const wrap = $('#sidebar-tags-wrap'), box = $('#sidebar-tags'); if (!box) return;
+  const set = new Set(); allCards.forEach((c) => (c.tags || []).forEach((t) => set.add(t)));
+  const tags = [...set].sort();
+  wrap.classList.toggle('hidden', tags.length === 0);
+  box.innerHTML = '';
+  tags.forEach((t) => {
+    const on = currentView.kind === 'tag' && activeTag === t;
+    const b = el('button', 'tag-chip transition hover:opacity-80'); b.textContent = '#' + t;
+    if (on) { b.style.background = 'var(--accent)'; b.style.color = 'var(--bg)'; }
+    b.addEventListener('click', () => { activeTag = t; setView({ kind: 'tag', tag: t }); });
+    box.append(b);
+  });
+}
+function openSidebarDrawer() { $('#sidebar').classList.add('open'); $('#sidebar-backdrop').classList.remove('hidden'); }
+function closeSidebarDrawer() { const s = $('#sidebar'); if (s) s.classList.remove('open'); const b = $('#sidebar-backdrop'); if (b) b.classList.add('hidden'); }
+
+// ---- list views (Today / Upcoming / All / Tag) ----
+function viewCards() {
+  if (currentView.kind === 'filter') return activeFilter ? filterCards(activeFilter) : [];
+  let list = allCards.slice();
+  if (currentView.kind === 'search') {
+    const q = searchQuery.toLowerCase();
+    if (!q) return [];
+    list = list.filter((c) => c.title.toLowerCase().includes(q) || (c.note || '').toLowerCase().includes(q) || (c.tags || []).some((t) => t.includes(q)));
+  } else if (currentView.kind === 'tag') list = list.filter((c) => (c.tags || []).includes(activeTag));
+  else if (currentView.kind === 'today') list = list.filter((c) => c.dueAt && dayStart(new Date(c.dueAt)) <= todayStart());
+  else if (currentView.kind === 'upcoming') { const end = todayStart(); end.setDate(end.getDate() + 7); list = list.filter((c) => c.dueAt && dayStart(new Date(c.dueAt)) <= end); }
+  list.sort(sorterFor(listSort));
+  return list;
+}
+// Apply a saved-filter's criteria to the full active set.
+function filterCards(f) {
+  return allCards.filter((c) => {
+    if (f.tags && f.tags.length && !f.tags.every((t) => (c.tags || []).includes(t))) return false;
+    if (f.priority && (c.priority || 0) < f.priority) return false;
+    if (f.boards && f.boards.length && !f.boards.includes(c.boardId)) return false;
+    if (f.due && f.due !== 'any') {
+      if (!c.dueAt) return false;
+      const dd = dayStart(new Date(c.dueAt));
+      if (f.due === 'today' && dd > todayStart()) return false;
+      if (f.due === 'week') { const e = todayStart(); e.setDate(e.getDate() + 7); if (dd > e) return false; }
+      if (f.due === 'overdue' && dueClass(c.dueAt) !== 'overdue') return false;
+    }
+    return true;
+  }).sort(sorterFor(listSort));
+}
+function groupHeader(text) { return el('div', 'px-1 pb-1 pt-3 text-[10px] font-semibold uppercase tracking-wider text-ink-faint first:pt-0', text); }
+function renderListView() {
+  const root = $('#list-view'); if (!root) return; root.innerHTML = '';
+  if (currentView.kind === 'calendar') { $('#view-count').textContent = ''; renderCalendar(root); return; }
+  if (currentView.kind === 'journal') { $('#view-count').textContent = ''; renderJournal(root); return; }
+  if (currentView.kind === 'matrix') { renderMatrix(root); return; }
+  if (currentView.kind === 'habits') { renderHabits(root); return; }
+  if (currentView.kind === 'focuses') { renderFocusesView(root); return; }
+  const list = viewCards();
+  $('#view-count').textContent = list.length ? String(list.length) : '';
+  const isDateView = currentView.kind === 'today' || currentView.kind === 'upcoming';
+  const wrap = el('div', 'mx-auto w-full ' + (isDateView ? 'max-w-2xl' : 'max-w-6xl'));
+  if (!list.length) { root.append(listEmptyState()); return; }
+  const bar = el('div', 'mb-3 flex items-center justify-end gap-2');
+  bar.append(el('span', 'text-xs text-ink-faint', 'Sort'));
+  const sortSel = el('select', 'rounded-lg border border-edge bg-panel px-2 py-1 text-xs text-ink-soft');
+  [['smart', 'Smart'], ['due', 'Due date'], ['priority', 'Priority'], ['created', 'Created'], ['alpha', 'A–Z']].forEach(([v, l]) => { const o = el('option', '', l); o.value = v; sortSel.append(o); });
+  sortSel.value = listSort;
+  sortSel.addEventListener('change', () => { listSort = sortSel.value; try { localStorage.setItem('tf-sort', listSort); } catch (_) {} renderListView(); });
+  bar.append(sortSel);
+  wrap.append(bar);
+  const groups = new Map();
+  const pushGroup = (k, c) => { if (!groups.has(k)) groups.set(k, []); groups.get(k).push(c); };
+  if (currentView.kind === 'all' || currentView.kind === 'tag' || currentView.kind === 'search' || currentView.kind === 'filter') {
+    list.forEach((c) => { const b = boards.find((x) => x.id === c.boardId); pushGroup(b ? b.icon + '  ' + b.name : 'Other', c); });
+  } else {
+    list.forEach((c) => pushGroup(dueClass(c.dueAt) === 'overdue' ? 'Overdue' : formatDue(dayStart(new Date(c.dueAt)).toISOString()), c));
+  }
+  if (isDateView) {
+    // Clean single-column agenda — chronological, with accented date headers.
+    groups.forEach((cards, label) => {
+      const head = el('div', 'mb-2 mt-6 flex items-center gap-2 first:mt-0');
+      const accent = el('span', 'h-4 w-1 shrink-0 rounded-full'); accent.style.background = label === 'Overdue' ? '#f87171' : (label === 'Today' ? 'var(--accent)' : 'var(--edge-strong)');
+      head.append(accent, el('span', 'text-sm font-semibold text-ink', label), el('span', 'nav-count', String(cards.length)));
+      wrap.append(head);
+      const g = el('div', 'space-y-1.5'); cards.forEach((c) => g.append(taskRow(c))); wrap.append(g);
+    });
+  } else {
+    const cols = el('div', 'columns-1 lg:columns-2 2xl:columns-3'); cols.style.columnGap = '1.25rem';
+    groups.forEach((cards, label) => {
+      const block = el('div', 'mb-4 break-inside-avoid');
+      block.append(groupHeader(label));
+      const g = el('div', 'space-y-1.5'); cards.forEach((c) => g.append(taskRow(c)));
+      block.append(g); cols.append(block);
+    });
+    wrap.append(cols);
+  }
+  root.append(wrap);
+}
+function listEmptyState() {
+  const box = el('div', 'flex h-full flex-col items-center justify-center gap-3 px-6 py-16 text-center');
+  const msg = { today: 'Nothing due today. 🎉', upcoming: 'Nothing due in the next 7 days.', all: 'No tasks yet — add one from the sidebar.', tag: 'No tasks with this tag.', search: searchQuery ? `No tasks match “${searchQuery}”.` : 'Type to search your tasks.' }[currentView.kind] || 'Nothing here.';
+  box.append(el('div', 'text-4xl', '🗒️'), el('p', 'max-w-sm text-sm text-ink-faint', msg));
+  return box;
+}
+function taskRow(card) {
+  const row = el('div', 'group flex items-start gap-3 rounded-xl border border-edge bg-card px-3 py-2.5 transition hover:border-edge-strong');
+  if (card.priority) { row.style.borderLeftColor = PRIORITY_HEX[card.priority]; row.style.borderLeftWidth = '3px'; }
+  const box = el('button', 'mt-0.5 grid h-4 w-4 shrink-0 place-items-center rounded-full border-2 text-transparent transition hover:text-ink-soft');
+  box.style.borderColor = priorityColor(card.priority) || 'var(--ink-faint)'; box.title = 'Complete'; box.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" class="h-2.5 w-2.5"><path d="M20 6 9 17l-5-5"/></svg>';
+  box.addEventListener('click', (e) => { e.stopPropagation(); completeCard(card.id); });
+  const mid = el('div', 'min-w-0 flex-1 cursor-pointer'); mid.addEventListener('click', () => openTaskModal(card));
+  mid.append(el('div', 'truncate text-sm text-ink', card.title));
+  const meta = el('div', 'mt-1 flex flex-wrap items-center gap-1.5');
+  if (card.dueAt) { const p = el('span', 'due-pill ' + dueClass(card.dueAt)); p.innerHTML = CLOCK_SVG; p.append(el('span', '', formatDue(card.dueAt))); meta.append(p); }
+  const b = boards.find((x) => x.id === card.boardId);
+  if (b && currentView.kind !== 'board') meta.append(el('span', 'tag-chip', b.icon + ' ' + b.name));
+  (card.tags || []).forEach((t) => meta.append(el('span', 'tag-chip', '#' + t)));
+  if (card.recur) meta.append(el('span', 'tag-chip', '🔁'));
+  if (card.duration) meta.append(el('span', 'tag-chip', '⏱ ' + fmtDur(card.duration)));
+  if (card.note) { const nn = el('span', 'tag-chip', '📝'); nn.title = 'Has notes'; meta.append(nn); }
+  const subs = subtasksOf(card);
+  if (subs.length) meta.append(el('span', 'tag-chip', `☑ ${subs.filter((s) => s.done).length}/${subs.length}`));
+  if (meta.childNodes.length) mid.append(meta);
+  row.append(box, mid);
+  return row;
+}
+async function completeCard(id) {
+  allCards = allCards.filter((c) => c.id !== id);
+  state.cards = state.cards.filter((c) => c.id !== id);
+  renderCurrentView(); renderSidebar();
+  try { const { cards } = await request(`/cards/${id}/archive`, { method: 'POST' }); if (currentBoard) state.cards = cards; await loadActive(); renderCurrentView(); renderSidebar(); toast('Completed ✓'); }
+  catch (err) { if (!handleApiError(err)) { loadActive(); loadCards(); } }
+}
+
+// ---- "In Focus" — a master list of each board's current focus ----
+function renderFocusesView(root) {
+  const outer = el('div', 'flex min-h-full w-full items-center justify-center py-4');
+  const wrap = el('div', 'grid w-full max-w-5xl grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-3');
+  let n = 0;
+  boards.forEach((bd) => {
+    const focus = boardFocus(bd);
+    const card = el('button', 'flex min-h-[7rem] flex-col rounded-2xl border border-edge bg-card p-4 text-left transition hover:border-edge-strong');
+    card.addEventListener('click', () => openBoard(bd.id));
+    const top = el('div', 'mb-2 flex items-center gap-2');
+    top.append(el('span', 'shrink-0 text-xl leading-none', bd.icon), el('span', 'truncate text-[10px] font-semibold uppercase tracking-wider text-ink-faint', bd.focusLabel || bd.name));
+    card.append(top);
+    if (focus) {
+      n++;
+      card.append(el('div', 'text-base font-semibold leading-snug text-ink line-clamp-3', focus.title));
+      if (focus.dueAt) { const p = el('span', 'due-pill mt-2 self-start ' + dueClass(focus.dueAt)); p.innerHTML = CLOCK_SVG; p.append(el('span', '', formatDue(focus.dueAt))); card.append(p); }
+    } else card.append(el('div', 'text-sm text-ink-faint', 'No focus set — tap to choose'));
+    wrap.append(card);
+  });
+  $('#view-count').textContent = n ? String(n) : '';
+  outer.append(wrap); root.append(outer);
+}
+
+// ---- Habits ----
+async function loadHabits() { try { const { habits: h, checkins } = await request('/habits'); habits = h || []; habitCheckins = new Set((checkins || []).map((c) => c.habitId + '|' + c.day)); } catch (_) { habits = []; habitCheckins = new Set(); } }
+function habitDaySet(habitId) { const s = new Set(); habitCheckins.forEach((k) => { const i = k.indexOf('|'); if (k.slice(0, i) === habitId) s.add(k.slice(i + 1)); }); return s; }
+function habitStreak(days) { let n = 0; const d = new Date(); if (!days.has(ymd(d))) d.setDate(d.getDate() - 1); while (days.has(ymd(d))) { n++; d.setDate(d.getDate() - 1); } return n; }
+async function toggleHabit(habitId, day) {
+  const key = habitId + '|' + day;
+  if (habitCheckins.has(key)) habitCheckins.delete(key); else habitCheckins.add(key);
+  if (currentView.kind === 'habits') renderHabits($('#list-view'));
+  try { await request('/habits/' + habitId + '/toggle', { method: 'POST', body: JSON.stringify({ day }) }); }
+  catch (err) { if (habitCheckins.has(key)) habitCheckins.delete(key); else habitCheckins.add(key); if (currentView.kind === 'habits') renderHabits($('#list-view')); handleApiError(err); }
+}
+function renderHabits(root) {
+  root.innerHTML = ''; // toggleHabit / editor call this directly — clear so lists never stack
+  $('#view-count').textContent = habits.length ? String(habits.length) : '';
+  const wrap = el('div', 'mx-auto w-full max-w-4xl');
+  const addBtn = el('button', 'btn-accent mb-4 rounded-lg px-4 py-2 text-sm font-semibold transition hover:opacity-90', '+ New habit');
+  addBtn.addEventListener('click', () => openHabitEditor(null));
+  wrap.append(addBtn);
+  if (!habits.length) { wrap.append(el('p', 'py-8 text-center text-sm text-ink-faint', 'No habits yet — add one to start building streaks.')); root.append(wrap); return; }
+  const today = new Date();
+  const last7 = []; for (let i = 6; i >= 0; i--) { const d = new Date(today); d.setDate(today.getDate() - i); last7.push(d); }
+  const DOW = ['S', 'M', 'T', 'W', 'T', 'F', 'S'];
+  const list = el('div', 'space-y-2');
+  habits.forEach((h) => {
+    const days = habitDaySet(h.id), streak = habitStreak(days);
+    const row = el('div', 'flex items-center gap-3 rounded-xl border border-edge bg-card px-4 py-3');
+    row.style.borderLeftColor = h.color; row.style.borderLeftWidth = '3px';
+    const left = el('div', 'flex min-w-0 flex-1 items-center gap-2');
+    left.append(el('span', 'shrink-0 text-lg', h.icon), el('span', 'truncate text-sm font-medium text-ink', h.name));
+    if (streak) left.append(el('span', 'shrink-0 tag-chip', '🔥 ' + streak));
+    const daysWrap = el('div', 'flex shrink-0 items-center gap-1');
+    last7.forEach((d) => {
+      const ds = ymd(d), done = days.has(ds), isToday = ds === ymd(today);
+      const cell = el('div', 'flex flex-col items-center gap-0.5');
+      cell.append(el('span', 'text-[9px] text-ink-faint', DOW[d.getDay()]));
+      const c = el('button', 'grid h-8 w-8 place-items-center rounded-full border-2 text-[10px] tabular-nums transition');
+      c.title = d.toLocaleDateString([], { weekday: 'long', day: 'numeric', month: 'short' });
+      c.style.borderColor = done ? h.color : (isToday ? 'var(--edge-strong)' : 'var(--edge)');
+      c.style.background = done ? h.color : 'transparent';
+      c.style.color = done ? '#fff' : 'var(--ink-faint)';
+      c.textContent = String(d.getDate());
+      c.addEventListener('click', () => toggleHabit(h.id, ds));
+      cell.append(c); daysWrap.append(cell);
+    });
+    const edit = el('button', 'shrink-0 rounded-md p-1 text-ink-faint transition hover:text-ink', '✎'); edit.title = 'Edit habit';
+    edit.addEventListener('click', () => openHabitEditor(h));
+    row.append(left, daysWrap, edit); list.append(row);
+  });
+  wrap.append(list); root.append(wrap);
+}
+const HABIT_ICONS = ['✅', '💧', '🏃', '📚', '🧘', '💪', '🥗', '😴', '🚭', '🦷', '🧹', '✍️', '🎸', '🌱', '☀️', '💊'];
+function openHabitEditor(habit) {
+  const modal = $('#habit-modal'); modal.innerHTML = '';
+  const panel = modalShell(habit ? 'Edit habit' : 'New habit', () => closeModal('#habit-modal')); panel.classList.add('max-w-sm');
+  const name = el('input', 'field'); name.placeholder = 'Habit name (e.g. Drink water)'; name.value = habit ? habit.name : '';
+  let icon = habit ? habit.icon : '✅', color = habit ? habit.color : '#34d399';
+  const iconRow = el('div', 'flex flex-wrap gap-1'); const iconBtns = [];
+  HABIT_ICONS.forEach((em) => { const b = el('button', 'grid h-8 w-8 place-items-center rounded-lg border border-edge text-base', em); b.type = 'button'; if (em === icon) b.classList.add('border-edge-strong'); b.addEventListener('click', () => { icon = em; iconBtns.forEach((x) => x.classList.remove('border-edge-strong')); b.classList.add('border-edge-strong'); }); iconBtns.push(b); iconRow.append(b); });
+  const colorIn = el('input', 'h-9 w-full rounded border border-edge bg-transparent'); colorIn.type = 'color'; colorIn.value = color; colorIn.addEventListener('input', () => { color = colorIn.value; });
+  const err = el('p', 'mt-1 hidden text-xs text-red-400');
+  const save = el('button', 'btn-accent mt-3 w-full rounded-lg px-4 py-2 text-sm font-semibold transition hover:opacity-90', 'Save habit');
+  save.addEventListener('click', async () => {
+    if (!name.value.trim()) { err.textContent = 'A name is required.'; err.classList.remove('hidden'); return; }
+    try {
+      if (habit) await request('/habits/' + habit.id, { method: 'PATCH', body: JSON.stringify({ name: name.value, icon, color }) });
+      else await request('/habits', { method: 'POST', body: JSON.stringify({ name: name.value, icon, color }) });
+      await loadHabits(); closeModal('#habit-modal'); renderSidebar(); if (currentView.kind === 'habits') renderHabits($('#list-view')); toast(habit ? 'Habit updated' : 'Habit added');
+    } catch (e) { err.textContent = e.message; err.classList.remove('hidden'); }
+  });
+  panel.append(el('label', 'mb-1 block text-xs text-ink-soft', 'Name'), name, el('label', 'mb-1 mt-3 block text-xs text-ink-soft', 'Icon'), iconRow, el('label', 'mb-1 mt-3 block text-xs text-ink-soft', 'Colour'), colorIn, err, save);
+  if (habit) {
+    const del = el('button', 'mt-2 w-full rounded-lg border border-edge px-4 py-2 text-sm font-medium text-red-400 transition hover:bg-edge', 'Delete habit');
+    del.addEventListener('click', async () => { if (!confirm(`Delete "${habit.name}" and all its history?`)) return; try { await request('/habits/' + habit.id, { method: 'DELETE' }); await loadHabits(); closeModal('#habit-modal'); renderSidebar(); if (currentView.kind === 'habits') renderHabits($('#list-view')); toast('Habit deleted'); } catch (e) { handleApiError(e); } });
+    panel.append(del);
+  }
+  modal.append(panel); openModal('#habit-modal');
+}
+
+// ---- Eisenhower priority matrix (urgent × important) ----
+function renderMatrix(root) {
+  const soon = todayStart(); soon.setDate(soon.getDate() + 2); // "urgent" = due within ~2 days (incl. overdue)
+  const urgent = (c) => c.dueAt && dayStart(new Date(c.dueAt)) <= soon;
+  const important = (c) => (c.priority || 0) >= 2;
+  const quads = [
+    { title: 'Do first', sub: 'Important · Urgent', color: '#f87171', test: (c) => important(c) && urgent(c) },
+    { title: 'Schedule', sub: 'Important · Not urgent', color: '#60a5fa', test: (c) => important(c) && !urgent(c) },
+    { title: 'Delegate', sub: 'Not important · Urgent', color: '#fbbf24', test: (c) => !important(c) && urgent(c) },
+    { title: 'Later', sub: 'Not important · Not urgent', color: '#a1a1aa', test: (c) => !important(c) && !urgent(c) },
+  ];
+  $('#view-count').textContent = allCards.length ? String(allCards.length) : '';
+  const grid = el('div', 'grid h-full min-h-0 w-full grid-cols-1 gap-3 md:grid-cols-2 md:grid-rows-2');
+  quads.forEach((q) => {
+    const items = allCards.filter(q.test).sort((a, b) => (dueSortKey(a) - dueSortKey(b)) || ((b.priority || 0) - (a.priority || 0)));
+    const box = el('div', 'flex min-h-0 flex-col overflow-hidden rounded-2xl border border-edge bg-panel');
+    box.style.borderTopColor = q.color; box.style.borderTopWidth = '3px';
+    const head = el('div', 'flex items-baseline justify-between gap-2 border-b border-edge px-4 py-2.5');
+    head.append(el('div', 'text-sm font-semibold text-ink', q.title), el('div', 'text-[10px] uppercase tracking-wider text-ink-faint', q.sub));
+    const body = el('div', 'clean-scroll flex-1 space-y-1.5 overflow-y-auto p-3');
+    if (!items.length) body.append(el('p', 'px-1 py-4 text-center text-xs text-ink-faint', 'Nothing here'));
+    else items.forEach((c) => body.append(taskRow(c)));
+    box.append(head, body); grid.append(box);
+  });
+  root.append(grid);
+}
+
+// ---- Calendar (month grid of tasks by due date) ----
+function renderCalendar(root) {
+  root.innerHTML = ''; // month-nav calls this directly — clear so views never stack
+  if (!calCursor) { const n = new Date(); calCursor = new Date(n.getFullYear(), n.getMonth(), 1); }
+  const wrap = el('div', 'flex h-full w-full flex-col');
+  const head = el('div', 'mb-3 flex items-center justify-between gap-2');
+  head.append(el('div', 'text-sm font-semibold text-ink', calCursor.toLocaleDateString([], { month: 'long', year: 'numeric' })));
+  const nav = el('div', 'flex items-center gap-1');
+  const iconBtn = (label, title, fn) => { const b = el('button', 'grid h-8 w-8 place-items-center rounded-lg border border-edge text-ink-soft transition hover:text-ink', label); b.title = title; b.addEventListener('click', fn); return b; };
+  const goto = (y, m) => { calCursor = new Date(y, m, 1); renderCalendar(root); };
+  const todayBtn = el('button', 'rounded-lg border border-edge px-2.5 text-xs font-medium text-ink-soft transition hover:text-ink', 'Today');
+  todayBtn.addEventListener('click', () => { const n = new Date(); goto(n.getFullYear(), n.getMonth()); });
+  nav.append(
+    iconBtn('‹', 'Previous month', () => goto(calCursor.getFullYear(), calCursor.getMonth() - 1)),
+    todayBtn,
+    iconBtn('›', 'Next month', () => goto(calCursor.getFullYear(), calCursor.getMonth() + 1)),
+  );
+  head.append(nav); wrap.append(head);
+
+  const dow = el('div', 'mb-1 grid grid-cols-7 gap-1');
+  ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'].forEach((d) => dow.append(el('div', 'px-1 text-center text-[10px] font-semibold uppercase tracking-wider text-ink-faint', d)));
+  wrap.append(dow);
+
+  const byDay = new Map();
+  allCards.forEach((c) => { if (!c.dueAt) return; const k = dayStart(new Date(c.dueAt)).getTime(); if (!byDay.has(k)) byDay.set(k, []); byDay.get(k).push(c); });
+  const first = new Date(calCursor.getFullYear(), calCursor.getMonth(), 1);
+  const startDow = (first.getDay() + 6) % 7; // Monday-first
+  const gridStart = new Date(first); gridStart.setDate(first.getDate() - startDow);
+  const todayT = todayStart().getTime();
+  const grid = el('div', 'grid min-h-0 flex-1 grid-cols-7 grid-rows-6 gap-1');
+  for (let i = 0; i < 42; i++) {
+    const day = new Date(gridStart); day.setDate(gridStart.getDate() + i);
+    const inMonth = day.getMonth() === calCursor.getMonth();
+    const dayT = dayStart(day).getTime();
+    const cell = el('div', 'flex min-h-0 flex-col overflow-hidden rounded-lg border border-edge p-1 ' + (inMonth ? 'bg-card' : 'opacity-40'));
+    const top = el('div', 'mb-0.5 px-0.5');
+    const dn = el('span', 'text-xs ' + (dayT === todayT ? 'inline-grid h-5 w-5 place-items-center rounded-full font-bold' : 'text-ink-soft'));
+    dn.textContent = String(day.getDate());
+    if (dayT === todayT) { dn.style.background = 'var(--accent)'; dn.style.color = 'var(--bg)'; }
+    top.append(dn); cell.append(top);
+    const items = (byDay.get(dayT) || []).slice().sort((a, b) => dueSortKey(a) - dueSortKey(b));
+    items.slice(0, 3).forEach((c) => {
+      const chip = el('button', 'mb-0.5 block w-full truncate rounded px-1 py-0.5 text-left text-[10px] leading-tight ' + (dueClass(c.dueAt) === 'overdue' ? 'text-red-400' : 'text-ink-soft'));
+      chip.style.background = 'var(--edge)'; chip.textContent = c.title; chip.title = c.title;
+      chip.addEventListener('click', (e) => { e.stopPropagation(); openTaskModal(c); });
+      cell.append(chip);
+    });
+    if (items.length > 3) cell.append(el('div', 'px-1 text-[9px] text-ink-faint', '+' + (items.length - 3) + ' more'));
+    grid.append(cell);
+  }
+  wrap.append(grid);
+  root.append(wrap);
+}
+
+// ---- Journal (one free-text entry per day, with a calendar to navigate) ----
+function ymd(d) { const p = (n) => String(n).padStart(2, '0'); return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`; }
+function fromYmd(s) { const [y, m, d] = s.split('-').map(Number); return new Date(y, m - 1, d); }
+async function loadJournalDays() { try { const { days } = await request('/journal/days'); journalEntries = days || []; journalDays = new Set(journalEntries.map((e) => e.day)); } catch (_) {} }
+function renderJournalEntriesList() {
+  const box = $('#journal-entries'); if (!box) return; box.innerHTML = '';
+  if (!journalEntries.length) return;
+  box.append(el('div', 'mb-1.5 px-1 text-[10px] font-semibold uppercase tracking-wider text-ink-faint', 'Entries'));
+  const list = el('div', 'space-y-1');
+  (journalShowAll ? journalEntries : journalEntries.slice(0, 10)).forEach((e) => {
+    const active = e.day === journalDay;
+    const row = el('button', 'flex w-full flex-col items-start rounded-lg border px-3 py-2 text-left transition ' + (active ? 'border-edge-strong bg-card' : 'border-edge hover:border-edge-strong'));
+    const head = el('div', 'flex w-full items-center gap-1.5');
+    head.append(el('span', 'text-xs font-semibold text-ink', fromYmd(e.day).toLocaleDateString([], { weekday: 'short', day: 'numeric', month: 'short' })));
+    if (e.mood) head.append(el('span', 'text-xs', e.mood));
+    row.append(head);
+    if (e.snippet) row.append(el('span', 'mt-0.5 line-clamp-1 w-full text-xs text-ink-soft', e.snippet));
+    row.addEventListener('click', () => selectJournalDay(e.day));
+    list.append(row);
+  });
+  box.append(list);
+  if (journalEntries.length > 10) {
+    const btn = el('button', 'mt-2 w-full rounded-lg border border-edge px-3 py-1.5 text-xs text-ink-soft transition hover:text-ink', journalShowAll ? 'Show less' : `Show all ${journalEntries.length}`);
+    btn.addEventListener('click', () => { journalShowAll = !journalShowAll; renderJournalEntriesList(); });
+    box.append(btn);
+  }
+}
+function scheduleJournalSave(day, content, mood, statusEl) { clearTimeout(journalSaveTimer); journalSaveTimer = setTimeout(() => flushJournalSave(day, content, mood, statusEl), 700); }
+async function flushJournalSave(day, content, mood, statusEl) {
+  clearTimeout(journalSaveTimer); journalSaveTimer = null;
+  try {
+    await request('/journal', { method: 'PUT', body: JSON.stringify({ day, content, mood: mood || '' }) });
+    if ((content && content.trim()) || mood) journalDays.add(day); else journalDays.delete(day);
+    if (statusEl) statusEl.textContent = 'Saved';
+  } catch (err) { if (statusEl) statusEl.textContent = 'Save failed'; }
+}
+function selectJournalDay(ds) {
+  const ta = $('#journal-ta'); if (ta) flushJournalSave(journalDay, ta.value, journalCurMood);
+  journalDay = ds; const d = fromYmd(ds); journalCursor = new Date(d.getFullYear(), d.getMonth(), 1);
+  renderJournal($('#list-view'));
+}
+function refreshJournalCal() { const s = $('#journal-cal-slot'); if (s) { s.innerHTML = ''; s.append(buildJournalCalendar()); } }
+function buildJournalCalendar() {
+  const wrap = el('div', 'rounded-2xl border border-edge bg-panel p-3');
+  const head = el('div', 'mb-2 flex items-center justify-between');
+  head.append(el('div', 'text-xs font-semibold text-ink', journalCursor.toLocaleDateString([], { month: 'long', year: 'numeric' })));
+  const nav = el('div', 'flex gap-1');
+  const b = (l, fn) => { const x = el('button', 'grid h-6 w-6 place-items-center rounded text-ink-soft transition hover:bg-edge hover:text-ink', l); x.addEventListener('click', fn); return x; };
+  nav.append(b('‹', () => { journalCursor = new Date(journalCursor.getFullYear(), journalCursor.getMonth() - 1, 1); refreshJournalCal(); }), b('›', () => { journalCursor = new Date(journalCursor.getFullYear(), journalCursor.getMonth() + 1, 1); refreshJournalCal(); }));
+  head.append(nav); wrap.append(head);
+  const dow = el('div', 'mb-1 grid grid-cols-7 gap-1');
+  ['M', 'T', 'W', 'T', 'F', 'S', 'S'].forEach((d) => dow.append(el('div', 'text-center text-[10px] font-semibold text-ink-faint', d)));
+  wrap.append(dow);
+  const first = new Date(journalCursor.getFullYear(), journalCursor.getMonth(), 1);
+  const startDow = (first.getDay() + 6) % 7; const gs = new Date(first); gs.setDate(first.getDate() - startDow);
+  const grid = el('div', 'grid grid-cols-7 gap-1');
+  const todayStr = ymd(new Date());
+  for (let i = 0; i < 42; i++) {
+    const day = new Date(gs); day.setDate(gs.getDate() + i); const ds = ymd(day);
+    const inMonth = day.getMonth() === journalCursor.getMonth(); const sel = ds === journalDay;
+    const cell = el('button', 'relative grid h-10 place-items-center rounded-md text-sm transition ' + (sel ? '' : 'hover:bg-edge ') + (inMonth ? 'text-ink-soft' : 'text-ink-faint opacity-50'));
+    cell.textContent = String(day.getDate());
+    if (sel) { cell.style.background = 'var(--accent)'; cell.style.color = 'var(--bg)'; }
+    else if (ds === todayStr) cell.style.outline = '1px solid var(--edge-strong)';
+    if (journalDays.has(ds) && !sel) { const dot = el('span', 'absolute bottom-1 h-1 w-1 rounded-full'); dot.style.background = 'var(--accent)'; cell.append(dot); }
+    cell.addEventListener('click', () => selectJournalDay(ds));
+    grid.append(cell);
+  }
+  wrap.append(grid);
+  return wrap;
+}
+const JOURNAL_MOODS = [['😄', 'Great'], ['🙂', 'Good'], ['😐', 'Okay'], ['😕', 'Low'], ['😢', 'Rough']];
+const JOURNAL_PROMPTS = [['🌟 Wins', 'What went well today?'], ['🙏 Grateful', "Three things I'm grateful for:"], ['💭 On my mind', "What's on my mind?"], ['🎯 Tomorrow', "Tomorrow I'll focus on:"]];
+function renderJournal(root) {
+  if (!root) return;
+  root.innerHTML = ''; // selectJournalDay calls this directly — clear so editors never stack
+  if (!journalDay) journalDay = ymd(new Date());
+  if (!journalCursor) { const d = fromYmd(journalDay); journalCursor = new Date(d.getFullYear(), d.getMonth(), 1); }
+  const day = journalDay; // capture so this editor always saves/loads its own day, even after switching
+  const container = el('div', 'flex h-full w-full flex-col gap-4 xl:flex-row');
+  const calSlot = el('div', 'shrink-0 xl:w-72'); calSlot.id = 'journal-cal-slot'; calSlot.append(buildJournalCalendar());
+  const entriesCol = el('div', 'clean-scroll flex shrink-0 flex-col xl:w-72 xl:min-h-0 xl:overflow-y-auto'); entriesCol.id = 'journal-entries';
+
+  const editor = el('div', 'flex min-h-0 flex-1 flex-col');
+  const head = el('div', 'mb-2 flex items-center justify-between gap-2');
+  head.append(el('div', 'text-sm font-semibold text-ink', fromYmd(day).toLocaleDateString([], { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })));
+  const status = el('span', 'text-xs text-ink-faint', '');
+  const todayBtn = el('button', 'rounded-lg border border-edge px-2.5 py-1 text-xs font-medium text-ink-soft transition hover:text-ink', 'Today');
+  todayBtn.addEventListener('click', () => selectJournalDay(ymd(new Date())));
+  const right = el('div', 'flex items-center gap-2'); right.append(status, todayBtn);
+  head.append(right);
+  editor.append(head);
+
+  const ta = el('textarea', 'clean-scroll max-h-[46vh] min-h-[150px] w-full flex-1 resize-none rounded-2xl border border-edge bg-panel p-4 text-sm leading-relaxed text-ink outline-none focus:border-edge-strong'); ta.id = 'journal-ta';
+  ta.placeholder = 'Write freely, or tap a prompt to get started…';
+  ta.maxLength = 100000;
+  const kickSave = () => { status.textContent = 'Saving…'; scheduleJournalSave(day, ta.value, journalCurMood, status); };
+  ta.addEventListener('input', kickSave);
+  ta.addEventListener('blur', () => { if (journalSaveTimer) flushJournalSave(day, ta.value, journalCurMood, status); });
+
+  const moodRow = el('div', 'mb-2 flex items-center gap-1');
+  moodRow.append(el('span', 'mr-1 text-xs text-ink-faint', 'Mood'));
+  const moodBtns = [];
+  JOURNAL_MOODS.forEach(([emoji, label]) => {
+    const b = el('button', 'grid h-8 w-8 place-items-center rounded-lg border border-edge text-lg transition hover:border-edge-strong'); b.type = 'button'; b.title = label; b.textContent = emoji;
+    b._paint = () => { const on = journalCurMood === emoji; b.style.borderColor = on ? 'var(--accent)' : 'var(--edge)'; b.style.background = on ? 'var(--focus-tint)' : 'transparent'; };
+    b.addEventListener('click', () => { journalCurMood = (journalCurMood === emoji) ? '' : emoji; moodBtns.forEach((x) => x._paint()); flushJournalSave(day, ta.value, journalCurMood, status); });
+    moodBtns.push(b); moodRow.append(b);
+  });
+  editor.append(moodRow);
+
+  const promptRow = el('div', 'mb-2 flex flex-wrap gap-1');
+  JOURNAL_PROMPTS.forEach(([label, text]) => {
+    const b = el('button', 'rounded-full border border-edge px-2.5 py-1 text-xs text-ink-soft transition hover:border-edge-strong hover:text-ink', label); b.type = 'button';
+    b.addEventListener('click', () => { const pre = ta.value ? (ta.value.endsWith('\n') ? '\n' : '\n\n') : ''; ta.value += `${pre}${text}\n`; ta.focus(); ta.selectionStart = ta.selectionEnd = ta.value.length; kickSave(); });
+    promptRow.append(b);
+  });
+  editor.append(promptRow, ta);
+
+  const done = el('div', 'mt-2 shrink-0'); done.id = 'journal-done';
+  editor.append(done);
+  container.append(calSlot, entriesCol, editor); root.append(container);
+
+  request('/journal?day=' + day).then(({ content, mood }) => { ta.value = content || ''; journalCurMood = mood || ''; moodBtns.forEach((x) => x._paint()); }).catch(() => {});
+  loadJournalDays().then(() => { refreshJournalCal(); renderJournalEntriesList(); });
+  renderJournalDone(done, day);
+}
+function renderJournalDone(container, day) {
+  request('/archive').then(({ archived }) => {
+    const items = (archived || []).filter((c) => c.completedAt && c.completedAt.slice(0, 10) === day);
+    container.innerHTML = '';
+    if (!items.length) return;
+    container.append(el('div', 'mb-1 text-[10px] font-semibold uppercase tracking-wider text-ink-faint', `✓ Completed this day · ${items.length}`));
+    const list = el('div', 'flex flex-wrap gap-1');
+    items.slice(0, 12).forEach((c) => list.append(el('span', 'tag-chip', c.title.length > 40 ? c.title.slice(0, 40) + '…' : c.title)));
+    container.append(list);
+  }).catch(() => {});
+}
+
+// ---- task detail editor (opened from list rows and kanban cards) ----
+function toLocalInput(iso) { if (!iso) return ''; const d = new Date(iso); if (Number.isNaN(d.getTime())) return ''; const p = (n) => String(n).padStart(2, '0'); return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`; }
+function openTaskModal(card) {
+  const modal = $('#task-modal'); modal.innerHTML = '';
+  const panel = modalShell('Task', () => closeModal('#task-modal')); panel.classList.add('max-w-md');
+  const draft = { title: card.title, note: card.note || '', dueAt: card.dueAt, startAt: card.startAt || null, remindAt: card.remindAt, duration: card.duration || 0, tags: (card.tags || []).slice(), priority: card.priority || 0, recur: card.recur || '' };
+
+  const title = el('textarea', 'field'); title.rows = 2; title.value = draft.title; title.maxLength = MAX_TITLE_LEN;
+  title.addEventListener('input', () => { draft.title = title.value; });
+
+  const noteWrap = el('div', 'mt-3');
+  noteWrap.append(el('label', 'mb-1 block text-xs text-ink-soft', 'Notes'));
+  const note = el('textarea', 'field'); note.rows = 3; note.value = draft.note; note.maxLength = 10000; note.placeholder = 'Add details…';
+  note.addEventListener('input', () => { draft.note = note.value; });
+  noteWrap.append(note);
+
+  const startWrap = el('div', 'mt-3');
+  startWrap.append(el('label', 'mb-1 block text-xs text-ink-soft', 'Start date'));
+  const start = el('input', 'field'); start.type = 'datetime-local'; start.value = toLocalInput(draft.startAt);
+  start.addEventListener('change', () => { draft.startAt = start.value ? new Date(start.value).toISOString() : null; });
+  startWrap.append(start);
+
+  const dueWrap = el('div', 'mt-3');
+  dueWrap.append(el('label', 'mb-1 block text-xs text-ink-soft', 'Due date & time'));
+  const due = el('input', 'field'); due.type = 'datetime-local'; due.value = toLocalInput(draft.dueAt);
+  due.addEventListener('change', () => { draft.dueAt = due.value ? new Date(due.value).toISOString() : null; syncReminderOptions(); });
+  const quickRow = el('div', 'mt-1.5 flex flex-wrap gap-1');
+  const quick = (label, fn) => { const b = el('button', 'rounded-md border border-edge px-2 py-1 text-xs text-ink-soft transition hover:text-ink'); b.type = 'button'; b.textContent = label; b.addEventListener('click', () => { fn(); due.value = toLocalInput(draft.dueAt); syncReminderOptions(); }); return b; };
+  const atNine = (d) => { d.setHours(9, 0, 0, 0); return d; };
+  quickRow.append(
+    quick('Today', () => { draft.dueAt = atNine(new Date()).toISOString(); }),
+    quick('Tomorrow', () => { const d = new Date(); d.setDate(d.getDate() + 1); draft.dueAt = atNine(d).toISOString(); }),
+    quick('Next week', () => { const d = new Date(); d.setDate(d.getDate() + 7); draft.dueAt = atNine(d).toISOString(); }),
+    quick('Clear', () => { draft.dueAt = null; draft.remindAt = null; }),
+  );
+  dueWrap.append(due, quickRow);
+
+  const remWrap = el('div', 'mt-3');
+  remWrap.append(el('label', 'mb-1 block text-xs text-ink-soft', 'Reminder'));
+  const rem = el('select', 'field');
+  const REM_OPTS = [['', 'None'], ['0', 'At time of task'], ['10', '10 minutes before'], ['60', '1 hour before'], ['1440', '1 day before']];
+  REM_OPTS.forEach(([v, l]) => { const o = el('option', '', l); o.value = v; rem.append(o); });
+  rem.addEventListener('change', () => { draft.remindAt = computeRemind(draft.dueAt, rem.value); });
+  function computeRemind(dueIso, minsStr) { if (!dueIso || minsStr === '') return null; const d = new Date(dueIso); d.setMinutes(d.getMinutes() - parseInt(minsStr, 10)); return d.toISOString(); }
+  function syncReminderOptions() {
+    rem.disabled = !draft.dueAt;
+    if (!draft.dueAt) { rem.value = ''; draft.remindAt = null; return; }
+    if (draft.remindAt) { const diff = Math.round((new Date(draft.dueAt) - new Date(draft.remindAt)) / 60000); rem.value = ['0', '10', '60', '1440'].includes(String(diff)) ? String(diff) : '0'; }
+    else rem.value = '';
+  }
+  remWrap.append(rem);
+
+  const durWrap = el('div', 'mt-3');
+  durWrap.append(el('label', 'mb-1 block text-xs text-ink-soft', 'Estimate'));
+  const durRow = el('div', 'flex flex-wrap gap-1');
+  const durInput = el('input', 'field w-24'); durInput.type = 'number'; durInput.min = '0'; durInput.step = '5'; durInput.value = draft.duration || ''; durInput.placeholder = 'min';
+  durInput.addEventListener('input', () => { draft.duration = parseInt(durInput.value, 10) || 0; });
+  const durQuick = (label, mins) => { const b = el('button', 'rounded-md border border-edge px-2 py-1 text-xs text-ink-soft transition hover:text-ink', label); b.type = 'button'; b.addEventListener('click', () => { draft.duration = mins; durInput.value = mins || ''; }); return b; };
+  durRow.append(durInput, durQuick('15m', 15), durQuick('30m', 30), durQuick('1h', 60), durQuick('2h', 120), durQuick('None', 0));
+  durWrap.append(durRow);
+
+  const prioWrap = el('div', 'mt-3');
+  prioWrap.append(el('label', 'mb-1 block text-xs text-ink-soft', 'Priority'));
+  const pRow = el('div', 'flex gap-1.5');
+  PRIORITY_LABEL.forEach((label, p) => {
+    const b = el('button', 'flex-1 rounded-lg border border-edge px-2 py-1.5 text-xs font-medium transition'); b.type = 'button'; b.textContent = label;
+    const paint = () => { const on = draft.priority === p; b.style.borderColor = on ? (PRIORITY_HEX[p] || 'var(--edge-strong)') : 'var(--edge)'; b.style.color = on ? (PRIORITY_HEX[p] || 'var(--ink)') : 'var(--ink-soft)'; };
+    b.addEventListener('click', () => { draft.priority = p; [...pRow.children].forEach((c, i) => c._paint && c._paint()); }); b._paint = paint; paint();
+    pRow.append(b);
+  });
+  prioWrap.append(pRow);
+
+  const tagWrap = el('div', 'mt-3');
+  tagWrap.append(el('label', 'mb-1 block text-xs text-ink-soft', 'Tags (space or comma separated)'));
+  const tagIn = el('input', 'field'); tagIn.value = draft.tags.join(' '); tagIn.placeholder = 'merlin work';
+  tagIn.addEventListener('input', () => { draft.tags = tagIn.value.split(/[\s,]+/).map((t) => t.replace(/^#/, '').toLowerCase()).filter(Boolean); });
+  tagWrap.append(tagIn);
+
+  const recWrap = el('div', 'mt-3');
+  recWrap.append(el('label', 'mb-1 block text-xs text-ink-soft', 'Repeat'));
+  const rec = el('select', 'field');
+  [['', 'Does not repeat'], ['daily', 'Every day'], ['weekday', 'Every weekday'], ['weekly', 'Every week'], ['biweekly', 'Every 2 weeks'], ['monthly', 'Every month'], ['yearly', 'Every year']].forEach(([v, l]) => { const o = el('option', '', l); o.value = v; rec.append(o); });
+  rec.value = draft.recur; rec.addEventListener('change', () => { draft.recur = rec.value; });
+  recWrap.append(rec);
+
+  syncReminderOptions();
+
+  const err = el('p', 'mt-2 hidden text-xs text-red-400');
+  const save = el('button', 'btn-accent mt-4 w-full rounded-lg px-4 py-2 text-sm font-semibold transition hover:opacity-90', 'Save');
+  save.addEventListener('click', async () => {
+    const body = { title: draft.title.trim() || card.title, note: draft.note, dueAt: draft.dueAt, startAt: draft.startAt, remindAt: draft.remindAt, duration: draft.duration, tags: draft.tags, priority: draft.priority, recur: draft.recur };
+    try {
+      await request(`/cards/${card.id}`, { method: 'PATCH', body: JSON.stringify(body) });
+      closeModal('#task-modal'); await loadActive(); if (currentBoard) await loadCards(); renderCurrentView(); renderSidebar(); toast('Saved');
+    } catch (e) { err.textContent = e.message; err.classList.remove('hidden'); }
+  });
+
+  const actions = el('div', 'mt-2 flex gap-2');
+  const done = el('button', 'flex-1 rounded-lg border border-edge px-3 py-2 text-xs font-medium text-ink-soft transition hover:text-ink', '✓ Complete');
+  done.addEventListener('click', () => { closeModal('#task-modal'); completeCard(card.id); });
+  const del = el('button', 'flex-1 rounded-lg border border-edge px-3 py-2 text-xs font-medium text-red-400 transition hover:bg-edge', 'Delete');
+  del.addEventListener('click', async () => { if (!confirm(`Delete "${card.title}"?`)) return; try { await request(`/cards/${card.id}`, { method: 'DELETE' }); closeModal('#task-modal'); await loadActive(); if (currentBoard) await loadCards(); renderCurrentView(); renderSidebar(); toast('Deleted'); } catch (e) { handleApiError(e); } });
+  actions.append(done, del);
+
+  panel.append(title, noteWrap, startWrap, dueWrap, remWrap, durWrap, prioWrap, tagWrap, recWrap, err, save, actions);
+  modal.append(panel); openModal('#task-modal');
+}
+
+// ---- push reminders ----
+function initPush() {
+  pushState.supported = ('serviceWorker' in navigator) && ('PushManager' in window) && ('Notification' in window);
+  request('/push/config').then((cfg) => { pushState.publicKey = cfg.publicKey || ''; pushState.serverEnabled = !!cfg.enabled; }).catch(() => {});
+  if (pushState.supported) navigator.serviceWorker.ready.then((reg) => reg.pushManager.getSubscription()).then((sub) => { pushState.enabled = !!sub; renderUserMenu(); }).catch(() => {});
+}
+function urlB64ToUint8Array(b64) { const pad = '='.repeat((4 - (b64.length % 4)) % 4); const s = (b64 + pad).replace(/-/g, '+').replace(/_/g, '/'); const raw = atob(s); const arr = new Uint8Array(raw.length); for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i); return arr; }
+async function enableReminders() {
+  if (!pushState.supported) return toast('This browser can’t do reminders');
+  if (!pushState.publicKey) return toast('Push isn’t configured on the server');
+  try {
+    const perm = await Notification.requestPermission();
+    if (perm !== 'granted') return toast('Allow notifications to get reminders');
+    const reg = await navigator.serviceWorker.ready;
+    const sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: urlB64ToUint8Array(pushState.publicKey) });
+    await request('/push/subscribe', { method: 'POST', body: JSON.stringify({ subscription: sub }) });
+    pushState.enabled = true; renderUserMenu(); toast('Reminders enabled ✓');
+  } catch (err) { toast('Could not enable reminders'); }
+}
+async function disableReminders() {
+  try { const reg = await navigator.serviceWorker.ready; const sub = await reg.pushManager.getSubscription(); if (sub) { await request('/push/unsubscribe', { method: 'POST', body: JSON.stringify({ endpoint: sub.endpoint }) }); await sub.unsubscribe(); } pushState.enabled = false; renderUserMenu(); toast('Reminders off'); } catch (_) {}
+}
+
+// ------------------------------------------------------------
+// Pomodoro focus timer
+// ------------------------------------------------------------
+const pomo = { mode: 'focus', remaining: 25 * 60, running: false, timer: null, focusMin: 25, breakMin: 5 };
+function fmtClock(s) { s = Math.max(0, Math.round(s)); return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`; }
+function pomoSessionsKey() { return 'tf-pomo-' + ymd(new Date()); }
+function getPomoSessions() { try { return parseInt(localStorage.getItem(pomoSessionsKey()) || '0', 10) || 0; } catch (_) { return 0; } }
+function addPomoSession() { try { localStorage.setItem(pomoSessionsKey(), String(getPomoSessions() + 1)); } catch (_) {} }
+function notifyPomo(title, body) { try { if ('Notification' in window && Notification.permission === 'granted') new Notification(title, { body, icon: '/icon-192.png' }); } catch (_) {} }
+function pomoRender() {
+  const label = $('#pomodoro-label'); if (label) { if (pomo.running) { label.classList.remove('hidden'); label.textContent = fmtClock(pomo.remaining); } else label.classList.add('hidden'); }
+  const btn = $('#pomodoro-btn'); if (btn) btn.style.borderColor = pomo.running ? (pomo.mode === 'focus' ? 'var(--accent)' : '#34d399') : '';
+  const clock = $('#pomo-clock'); if (clock) clock.textContent = fmtClock(pomo.remaining);
+  const md = $('#pomo-mode'); if (md) md.textContent = pomo.mode === 'focus' ? 'Focus' : 'Break';
+  const sc = $('#pomo-sessions'); if (sc) sc.textContent = String(getPomoSessions());
+  const sb = $('#pomo-startbtn'); if (sb) sb.textContent = pomo.running ? 'Pause' : 'Start';
+}
+function setPomoMode(m) { pomo.mode = m; pomo.remaining = (m === 'focus' ? pomo.focusMin : pomo.breakMin) * 60; }
+function pomoTick() {
+  pomo.remaining--;
+  if (pomo.remaining <= 0) {
+    if (pomo.mode === 'focus') { addPomoSession(); toast('🍅 Focus done — take a break'); notifyPomo('Break time', 'Focus session complete — take a break.'); setPomoMode('break'); }
+    else { toast('Break over — back to focus'); notifyPomo('Back to focus', 'Break over — start your next session.'); setPomoMode('focus'); }
+  }
+  pomoRender();
+}
+function pomoStart() { if (pomo.running) return; pomo.running = true; pomo.timer = setInterval(pomoTick, 1000); pomoRender(); }
+function pomoPause() { pomo.running = false; if (pomo.timer) { clearInterval(pomo.timer); pomo.timer = null; } pomoRender(); }
+function pomoToggle() { pomo.running ? pomoPause() : pomoStart(); }
+function pomoReset() { pomoPause(); pomo.remaining = (pomo.mode === 'focus' ? pomo.focusMin : pomo.breakMin) * 60; pomoRender(); }
+function pomoSkip() { setPomoMode(pomo.mode === 'focus' ? 'break' : 'focus'); pomoRender(); }
+function openPomodoro() {
+  const modal = $('#pomodoro-modal'); modal.innerHTML = '';
+  const panel = modalShell('Pomodoro', () => closeModal('#pomodoro-modal')); panel.classList.add('max-w-xs', 'text-center');
+  const mode = el('div', 'text-xs font-semibold uppercase tracking-[0.3em] text-ink-faint'); mode.id = 'pomo-mode';
+  const clock = el('div', 'my-3 text-6xl font-extrabold tabular-nums text-ink-strong'); clock.id = 'pomo-clock';
+  const row = el('div', 'flex justify-center gap-2');
+  const startBtn = el('button', 'btn-accent rounded-lg px-5 py-2 text-sm font-semibold', 'Start'); startBtn.id = 'pomo-startbtn'; startBtn.addEventListener('click', pomoToggle);
+  const resetBtn = el('button', 'rounded-lg border border-edge px-4 py-2 text-sm text-ink-soft transition hover:text-ink', 'Reset'); resetBtn.addEventListener('click', pomoReset);
+  const skipBtn = el('button', 'rounded-lg border border-edge px-4 py-2 text-sm text-ink-soft transition hover:text-ink', 'Skip'); skipBtn.addEventListener('click', pomoSkip);
+  row.append(startBtn, resetBtn, skipBtn);
+  const setRow = el('div', 'mt-4 flex items-center justify-center gap-4 text-xs text-ink-soft');
+  const mkNum = (label, val, onCh) => { const w = el('label', 'flex items-center gap-1'); const i = el('input', 'field w-14 text-center'); i.type = 'number'; i.min = '1'; i.value = String(val); i.addEventListener('change', () => onCh(parseInt(i.value, 10) || val)); w.append(i, el('span', '', label)); return w; };
+  setRow.append(
+    mkNum('focus', pomo.focusMin, (v) => { pomo.focusMin = v; try { localStorage.setItem('tf-pomo-focus', String(v)); } catch (_) {} if (!pomo.running && pomo.mode === 'focus') { pomo.remaining = v * 60; pomoRender(); } }),
+    mkNum('break', pomo.breakMin, (v) => { pomo.breakMin = v; try { localStorage.setItem('tf-pomo-break', String(v)); } catch (_) {} if (!pomo.running && pomo.mode === 'break') { pomo.remaining = v * 60; pomoRender(); } }),
+  );
+  const stats = el('div', 'mt-4 text-xs text-ink-faint'); stats.append(document.createTextNode('🍅 Completed today: '));
+  const scount = el('span', 'font-semibold text-ink'); scount.id = 'pomo-sessions'; stats.append(scount);
+  panel.append(mode, clock, row, setRow, stats);
+  modal.append(panel); openModal('#pomodoro-modal'); pomoRender();
+}
+
 // ------------------------------------------------------------
 // Misc
 // ------------------------------------------------------------
@@ -1161,9 +2096,15 @@ function setDate() { const node = $('#today'); if (!node) return; const tz = (cu
 function startPolling() { if (POLL_MS && !pollTimer) pollTimer = setInterval(poll, POLL_MS); }
 function stopPolling() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
 async function poll() {
-  if (!currentUser || !currentBoard || ui.draggingId || ui.editingLabel || ui.editingCard || ui.editingSubtask || ui.subtaskAdding) return;
-  try { const { cards } = await request(`/boards/${currentBoard.id}/cards`); if (JSON.stringify(cards) !== JSON.stringify(state.cards)) { state.cards = cards; render(); } }
-  catch (err) { if (err.status === 401) forceReauth(); }
+  if (!currentUser || ui.draggingId || ui.editingLabel || ui.editingCard || ui.editingSubtask || ui.subtaskAdding) return;
+  try {
+    if (currentView.kind === 'board' && currentBoard) {
+      const { cards } = await request(`/boards/${currentBoard.id}/cards`);
+      if (JSON.stringify(cards) !== JSON.stringify(state.cards)) { state.cards = cards; render(); }
+    }
+    const { cards: ac } = await request('/active');
+    if (JSON.stringify(ac) !== JSON.stringify(allCards)) { allCards = ac; renderSidebar(); if (currentView.kind !== 'board' && currentView.kind !== 'journal' && currentView.kind !== 'habits') renderListView(); }
+  } catch (err) { if (err.status === 401) forceReauth(); }
 }
 
 // ------------------------------------------------------------
@@ -1210,6 +2151,19 @@ function init() {
   attachDropzone($('#focus-zone'), () => (isSpotlight() ? null : { focused: true }));
   initDragTracking();
   renderThemeToggle();
+  // Sidebar drawer (mobile) + view controls
+  const st = $('#sidebar-toggle'); if (st) st.addEventListener('click', openSidebarDrawer);
+  const sb = $('#sidebar-backdrop'); if (sb) sb.addEventListener('click', closeSidebarDrawer);
+  const ap = $('#add-project-btn'); if (ap) ap.addEventListener('click', () => openBoardEditor(null));
+  const af = $('#add-filter-btn'); if (af) af.addEventListener('click', () => openFilterEditor(null));
+  try { pomo.focusMin = parseInt(localStorage.getItem('tf-pomo-focus'), 10) || 25; pomo.breakMin = parseInt(localStorage.getItem('tf-pomo-break'), 10) || 5; pomo.remaining = pomo.focusMin * 60; } catch (_) {}
+  const pb = $('#pomodoro-btn'); if (pb) pb.addEventListener('click', openPomodoro);
+  const ft = $('#focus-toggle'); if (ft) ft.addEventListener('click', () => { focusViewOn = !focusViewOn; try { localStorage.setItem('tf-focusview', focusViewOn ? '1' : '0'); } catch (_) {} applyViewLayout(); if (currentView.kind === 'board') render(); });
+  const search = $('#header-search'); if (search) search.addEventListener('input', () => {
+    searchQuery = search.value.trim();
+    if (searchQuery) { if (currentView.kind !== 'search') setView({ kind: 'search' }); else { renderHeaderForView(); renderListView(); } }
+    else if (currentView.kind === 'search') setView({ kind: 'today' });
+  });
   $('#auth-form').addEventListener('submit', submitAuth);
   $('#auth-toggle').addEventListener('click', () => setAuthMode(authMode === 'login' ? 'register' : 'login'));
   $('#auth-forgot').addEventListener('click', () => setAuthMode('recover'));
