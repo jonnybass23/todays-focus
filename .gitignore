@@ -3,3 +3,6 @@ data/
 *.log
 *.tmp
 .DS_Store
+
+# local dev tooling
+.claude/

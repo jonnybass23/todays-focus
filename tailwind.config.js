@@ -2,11 +2,11 @@
 module.exports = {
   content: ['./public/index.html', './public/app.js'],
   safelist: [
-    // md:grid-cols-N is built dynamically in app.js (Math.min(cols.length, 4))
-    'md:grid-cols-1',
-    'md:grid-cols-2',
-    'md:grid-cols-3',
-    'md:grid-cols-4',
+    // lg:grid-cols-N is built dynamically in app.js (Math.min(cols.length, 4))
+    'lg:grid-cols-1',
+    'lg:grid-cols-2',
+    'lg:grid-cols-3',
+    'lg:grid-cols-4',
   ],
   theme: {
     extend: {

@@ -11,6 +11,7 @@ const express = require('express');
 const cookieParser = require('cookie-parser');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const webpush = require('web-push');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
@@ -69,7 +70,13 @@ const MAX_BOARD_NAME = 40;
 const MAX_COLUMNS   = 8;
 const MAX_SUBTASKS  = 50;
 const MAX_SUBTASK_LEN = 200;
+const MAX_TAGS      = 20;
+const MAX_TAG_LEN   = 30;
+const MAX_NOTE_LEN  = 10000;
+const MAX_DURATION  = 100000; // minutes
+const RECUR_VALUES  = ['', 'daily', 'weekday', 'weekly', 'biweekly', 'monthly', 'yearly'];
 const RECOVERY_CODE_COUNT = 10;
+const VAPID_SUBJECT = process.env.VAPID_SUBJECT || 'mailto:admin@todays-focus.local';
 const MAX_CARDS_PER_USER  = parseInt(process.env.MAX_CARDS_PER_USER  || '500', 10);
 const MAX_BOARDS_PER_USER = parseInt(process.env.MAX_BOARDS_PER_USER || '20',  10);
 
@@ -100,6 +107,8 @@ const ADMIN_PASSWORD    = process.env.ADMIN_PASSWORD || '';
 
 const store = createStore(DB_FILE, { theme: DEFAULT_THEME, labels: DEFAULT_LABELS, focusColumns: DEFAULT_FOCUS_COLUMNS, seedBoards: SEED_BOARDS });
 const JWT_SECRET = loadJwtSecret();
+const VAPID = loadVapidKeys();
+if (VAPID) { try { webpush.setVapidDetails(VAPID_SUBJECT, VAPID.publicKey, VAPID.privateKey); } catch (e) { console.warn('  ▸ Push disabled — bad VAPID keys:', e.message); } }
 const COOKIE_MAX_AGE = JWT_TTL_DAYS * 24 * 60 * 60 * 1000;
 const DUMMY_HASH = bcrypt.hashSync('not-a-real-password', BCRYPT_ROUNDS);
 
@@ -124,6 +133,20 @@ function loadJwtSecret() {
   const p = path.join(DATA_DIR, '.jwtsecret');
   try { return fs.readFileSync(p, 'utf8').trim(); }
   catch { const secret = crypto.randomBytes(48).toString('hex'); fs.mkdirSync(DATA_DIR, { recursive: true }); fs.writeFileSync(p, secret, { mode: 0o600 }); return secret; }
+}
+// VAPID keypair for web-push. Set via env, or auto-generated once and saved to data/.vapid.json.
+function loadVapidKeys() {
+  if (process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY) return { publicKey: process.env.VAPID_PUBLIC_KEY, privateKey: process.env.VAPID_PRIVATE_KEY };
+  const p = path.join(DATA_DIR, '.vapid.json');
+  try { return JSON.parse(fs.readFileSync(p, 'utf8')); }
+  catch {
+    try {
+      const keys = webpush.generateVAPIDKeys();
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+      fs.writeFileSync(p, JSON.stringify(keys), { mode: 0o600 });
+      return keys;
+    } catch (e) { console.warn('  ▸ Could not generate VAPID keys:', e.message); return null; }
+  }
 }
 function parseTrustProxy(val, fallback) {
   if (val == null || val === '') return fallback;
@@ -216,6 +239,39 @@ function sanitizeSubtasks(list) {
     out.push({ id, text, done: !!s.done });
   }
   return out; // may be empty (user cleared all subtasks)
+}
+// A due/reminder timestamp: a valid ISO string, or null/'' to clear it.
+function normDateField(v) {
+  if (v === null || v === '' || v === undefined) return null;
+  if (typeof v !== 'string') return undefined; // invalid → ignore
+  const t = Date.parse(v);
+  return Number.isNaN(t) ? undefined : new Date(t).toISOString();
+}
+function sanitizeTags(list) {
+  if (!Array.isArray(list)) return null;
+  const out = [], seen = new Set();
+  for (const raw of list) {
+    if (typeof raw !== 'string') continue;
+    const tag = raw.trim().replace(/^#+/, '').replace(/\s+/g, '-').toLowerCase().slice(0, MAX_TAG_LEN);
+    if (!tag || seen.has(tag)) continue;
+    seen.add(tag); out.push(tag);
+    if (out.length >= MAX_TAGS) break;
+  }
+  return out;
+}
+const normRecur = (v) => (typeof v === 'string' && RECUR_VALUES.includes(v)) ? v : '';
+// Advance an ISO date by one recurrence step — used to spawn the next occurrence on completion.
+function advanceRecur(iso, rule) {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return null;
+  if (rule === 'daily') d.setDate(d.getDate() + 1);
+  else if (rule === 'weekly') d.setDate(d.getDate() + 7);
+  else if (rule === 'biweekly') d.setDate(d.getDate() + 14);
+  else if (rule === 'monthly') d.setMonth(d.getMonth() + 1);
+  else if (rule === 'yearly') d.setFullYear(d.getFullYear() + 1);
+  else if (rule === 'weekday') { do { d.setDate(d.getDate() + 1); } while (d.getDay() === 0 || d.getDay() === 6); }
+  else return null;
+  return d.toISOString();
 }
 function safeEqual(a, b) { const ba = Buffer.from(String(a)), bb = Buffer.from(String(b)); return ba.length === bb.length && crypto.timingSafeEqual(ba, bb); }
 function makeRecoveryCodes(n = RECOVERY_CODE_COUNT) {
@@ -451,19 +507,37 @@ app.post('/api/cards', requireAuth, (req, res) => {
   const board = (boardId && boards.find((b) => b.id === boardId)) || boards[0];
   if (!board) return res.status(400).json({ error: 'No board available to add to.' });
   const keys = board.columns.map((c) => c.key);
-  const card = store.createCard(req.user.id, board.id, { title: title.trim().slice(0, MAX_TITLE_LEN), type: keys.includes(type) ? type : keys[0] });
+  let card = store.createCard(req.user.id, board.id, { title: title.trim().slice(0, MAX_TITLE_LEN), type: keys.includes(type) ? type : keys[0] });
+  // Optional scheduling fields accepted at creation (quick-add sends these).
+  const extra = {};
+  const due = normDateField(req.body?.dueAt); if (due !== undefined) extra.dueAt = due;
+  const rem = normDateField(req.body?.remindAt); if (rem !== undefined) extra.remindAt = rem;
+  const tags = sanitizeTags(req.body?.tags); if (tags) extra.tags = tags;
+  if (req.body?.recur !== undefined) extra.recur = normRecur(req.body.recur);
+  if (typeof req.body?.priority === 'number' && [0, 1, 2, 3].includes(req.body.priority)) extra.priority = req.body.priority;
+  if (typeof req.body?.note === 'string') extra.note = req.body.note.slice(0, MAX_NOTE_LEN);
+  const startCreate = normDateField(req.body?.startAt); if (startCreate !== undefined) extra.startAt = startCreate;
+  if (typeof req.body?.duration === 'number' && req.body.duration >= 0) extra.duration = Math.min(Math.floor(req.body.duration), MAX_DURATION);
+  if (Object.keys(extra).length) card = store.updateCard(req.user.id, card.id, extra);
   res.status(201).json({ card, cards: store.getCards(board.id) });
 });
 app.patch('/api/cards/:id', requireAuth, (req, res) => {
   const row = store.getCardRow(req.user.id, req.params.id);
   if (!row) return res.status(404).json({ error: 'Card not found.' });
-  const { title, type, focused, subtasks, priority } = req.body || {};
+  const { title, type, focused, subtasks, priority, dueAt, remindAt, tags, recur, note, startAt, duration } = req.body || {};
   const fields = {};
   if (typeof title === 'string' && title.trim()) fields.title = title.trim().slice(0, MAX_TITLE_LEN);
   if (typeof type === 'string' && type.trim()) fields.type = type.trim().slice(0, 40);
   if (typeof focused === 'boolean') fields.focused = focused;
   if (subtasks !== undefined) { const s = sanitizeSubtasks(subtasks); if (s) fields.subtasks = s; }
   if (typeof priority === 'number' && [0, 1, 2, 3].includes(priority)) fields.priority = priority;
+  if ('dueAt' in (req.body || {})) { const d = normDateField(dueAt); if (d !== undefined) fields.dueAt = d; }
+  if ('remindAt' in (req.body || {})) { const r = normDateField(remindAt); if (r !== undefined) fields.remindAt = r; }
+  if ('tags' in (req.body || {})) { const t = sanitizeTags(tags); if (t) fields.tags = t; }
+  if ('recur' in (req.body || {})) fields.recur = normRecur(recur);
+  if (typeof note === 'string') fields.note = note.slice(0, MAX_NOTE_LEN);
+  if ('startAt' in (req.body || {})) { const s = normDateField(startAt); if (s !== undefined) fields.startAt = s; }
+  if (typeof duration === 'number' && duration >= 0) fields.duration = Math.min(Math.floor(duration), MAX_DURATION);
   const card = store.updateCard(req.user.id, req.params.id, fields);
   if (fields.focused === true) {
     const board = store.getBoard(req.user.id, row.board_id);
@@ -480,6 +554,19 @@ app.delete('/api/cards/:id', requireAuth, (req, res) => {
 app.post('/api/cards/:id/archive', requireAuth, (req, res) => {
   const row = store.getCardRow(req.user.id, req.params.id);
   if (!row) return res.status(404).json({ error: 'Card not found.' });
+  // Recurring task → spawn the next occurrence before completing this one.
+  if (row.recur && RECUR_VALUES.includes(row.recur) && row.recur !== '') {
+    const nextDue = advanceRecur(row.due_at || new Date().toISOString(), row.recur);
+    if (nextDue) {
+      const parseArr = (s) => { try { const v = JSON.parse(s); return Array.isArray(v) ? v : []; } catch { return []; } };
+      const next = store.createCard(req.user.id, row.board_id, { title: row.title, type: row.type });
+      const patch = { dueAt: nextDue, tags: parseArr(row.tags), recur: row.recur, priority: row.priority || 0 };
+      const subs = parseArr(row.subtasks).map((s) => ({ ...s, done: false }));
+      if (subs.length) patch.subtasks = subs;
+      if (row.remind_at) { const nr = advanceRecur(row.remind_at, row.recur); if (nr) patch.remindAt = nr; }
+      store.updateCard(req.user.id, next.id, patch);
+    }
+  }
   store.archiveCard(req.user.id, req.params.id);
   res.json({ cards: store.getCards(row.board_id) });
 });
@@ -509,6 +596,112 @@ app.put('/api/cards/order', requireAuth, (req, res) => {
 });
 app.get('/api/archive', requireAuth, (req, res) => res.json({ archived: store.getArchived(req.user.id) }));
 
+// All active cards across every board — powers the Today / Upcoming / All views and tag filters.
+app.get('/api/active', requireAuth, (req, res) => res.json({ cards: store.getActiveCards(req.user.id) }));
+
+// ============================================================
+// JOURNAL (one free-text entry per day)
+// ============================================================
+const MAX_JOURNAL_LEN = 100000;
+const validDay = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s);
+app.get('/api/journal/days', requireAuth, (req, res) => res.json({ days: store.getJournalDays(req.user.id).map((e) => ({ day: e.day, mood: e.mood, snippet: ((e.content || '').split('\n').map((l) => l.trim()).filter(Boolean)[0] || '').slice(0, 90) })) }));
+app.get('/api/journal', requireAuth, (req, res) => {
+  const day = req.query.day;
+  if (!validDay(day)) return res.status(400).json({ error: 'A valid "day" (YYYY-MM-DD) is required.' });
+  const e = store.getJournalEntry(req.user.id, day);
+  res.json({ day, content: e.content, mood: e.mood });
+});
+app.put('/api/journal', requireAuth, (req, res) => {
+  const { day, content, mood } = req.body || {};
+  if (!validDay(day)) return res.status(400).json({ error: 'A valid "day" (YYYY-MM-DD) is required.' });
+  const text = typeof content === 'string' ? content.slice(0, MAX_JOURNAL_LEN) : '';
+  const m = (typeof mood === 'string' && mood.length <= 8) ? mood : '';
+  store.saveJournalEntry(req.user.id, day, text, m);
+  res.json({ ok: true, day });
+});
+
+// ============================================================
+// SAVED FILTERS (smart lists)
+// ============================================================
+const DUE_RANGES = ['any', 'today', 'week', 'overdue'];
+function sanitizeFilter(f) {
+  if (!f || typeof f !== 'object') return null;
+  return {
+    id: (typeof f.id === 'string' && f.id.trim()) ? f.id.trim().slice(0, 64) : crypto.randomUUID(),
+    name: (typeof f.name === 'string' && f.name.trim()) ? f.name.trim().slice(0, 40) : 'Filter',
+    tags: sanitizeTags(f.tags) || [],
+    priority: [0, 1, 2, 3].includes(f.priority) ? f.priority : 0,
+    due: DUE_RANGES.includes(f.due) ? f.due : 'any',
+    boards: Array.isArray(f.boards) ? f.boards.filter((b) => typeof b === 'string').slice(0, 30) : [],
+  };
+}
+// ============================================================
+// HABITS
+// ============================================================
+const MAX_HABITS = 60;
+app.get('/api/habits', requireAuth, (req, res) => {
+  const since = new Date(Date.now() - 400 * 86400000).toISOString().slice(0, 10); // ~13 months of history
+  res.json({ habits: store.getHabits(req.user.id), checkins: store.getCheckins(req.user.id, since) });
+});
+app.post('/api/habits', requireAuth, (req, res) => {
+  if (store.getHabits(req.user.id).length >= MAX_HABITS) return res.status(400).json({ error: `Habit limit reached (${MAX_HABITS}).` });
+  const { name, icon, color } = req.body || {};
+  if (typeof name !== 'string' || !name.trim()) return res.status(400).json({ error: 'A habit name is required.' });
+  const habit = store.createHabit(req.user.id, { name: name.trim().slice(0, 60), icon: typeof icon === 'string' && icon.trim() ? icon.trim().slice(0, 8) : '✅', color: /^#[0-9a-fA-F]{6}$/.test(color) ? color : '#34d399' });
+  res.status(201).json({ habit: { id: habit.id, name: habit.name, icon: habit.icon, color: habit.color } });
+});
+app.patch('/api/habits/:id', requireAuth, (req, res) => {
+  const { name, icon, color } = req.body || {};
+  const fields = {};
+  if (typeof name === 'string' && name.trim()) fields.name = name.trim().slice(0, 60);
+  if (typeof icon === 'string' && icon.trim()) fields.icon = icon.trim().slice(0, 8);
+  if (typeof color === 'string' && /^#[0-9a-fA-F]{6}$/.test(color)) fields.color = color;
+  const habit = store.updateHabit(req.user.id, req.params.id, fields);
+  if (!habit) return res.status(404).json({ error: 'Habit not found.' });
+  res.json({ habit: { id: habit.id, name: habit.name, icon: habit.icon, color: habit.color } });
+});
+app.delete('/api/habits/:id', requireAuth, (req, res) => {
+  if (!store.deleteHabit(req.user.id, req.params.id)) return res.status(404).json({ error: 'Habit not found.' });
+  res.json({ ok: true });
+});
+app.post('/api/habits/:id/toggle', requireAuth, (req, res) => {
+  const day = req.body?.day;
+  if (!validDay(day)) return res.status(400).json({ error: 'A valid "day" (YYYY-MM-DD) is required.' });
+  const state = store.toggleCheckin(req.user.id, req.params.id, day);
+  if (state === null) return res.status(404).json({ error: 'Habit not found.' });
+  res.json({ checked: state });
+});
+
+app.get('/api/filters', requireAuth, (req, res) => res.json({ filters: store.getFilters(req.user.id) }));
+app.put('/api/filters', requireAuth, (req, res) => {
+  const arr = Array.isArray(req.body?.filters) ? req.body.filters.slice(0, 50).map(sanitizeFilter).filter(Boolean) : [];
+  store.setFilters(req.user.id, arr);
+  res.json({ filters: arr });
+});
+
+// ============================================================
+// WEB PUSH (reminders)
+// ============================================================
+app.get('/api/push/config', (req, res) => res.json({ enabled: !!VAPID, publicKey: VAPID ? VAPID.publicKey : '' }));
+app.post('/api/push/subscribe', requireCookie, (req, res) => {
+  if (!VAPID) return res.status(503).json({ error: 'Push notifications are not configured on this server.' });
+  const sub = req.body?.subscription || req.body;
+  if (!sub || typeof sub.endpoint !== 'string' || !sub.keys) return res.status(400).json({ error: 'A valid push subscription is required.' });
+  store.saveSubscription(req.user.id, sub);
+  res.status(201).json({ ok: true });
+});
+app.post('/api/push/unsubscribe', requireCookie, (req, res) => {
+  if (req.body?.endpoint) store.deleteSubscription(String(req.body.endpoint));
+  res.json({ ok: true });
+});
+app.post('/api/push/test', requireCookie, async (req, res) => {
+  if (!VAPID) return res.status(503).json({ error: 'Push notifications are not configured.' });
+  const subs = store.getSubscriptions(req.user.id);
+  if (!subs.length) return res.status(400).json({ error: 'No device is subscribed on this account yet — enable reminders first.' });
+  await Promise.all(subs.map((s) => sendPush(s, { title: "Today's Focus", body: 'Reminders are working ✓', url: '/' })));
+  res.json({ ok: true, sent: subs.length });
+});
+
 // ============================================================
 // SETTINGS · HISTORY · EXPORT
 // ============================================================
@@ -536,6 +729,34 @@ app.use('/api', (req, res) => res.status(404).json({ error: 'Unknown API endpoin
 app.use(express.static(PUBLIC_DIR));
 app.get('/privacy', (req, res) => res.sendFile(path.join(PUBLIC_DIR, 'privacy.html')));
 app.get('*', (req, res) => res.sendFile(path.join(PUBLIC_DIR, 'index.html')));
+
+// ============================================================
+// PUSH DELIVERY + REMINDER SCHEDULER
+// ============================================================
+async function sendPush(sub, payload) {
+  if (!VAPID) return;
+  try { await webpush.sendNotification({ endpoint: sub.endpoint, keys: sub.keys }, JSON.stringify(payload)); }
+  catch (err) { if (err && (err.statusCode === 404 || err.statusCode === 410)) store.deleteSubscription(sub.endpoint); }
+}
+const REMINDER_SWEEP_MS = 30 * 1000;
+let sweeping = false;
+async function runReminderSweep() {
+  if (!VAPID || sweeping) return;
+  sweeping = true;
+  try {
+    const due = store.getDueReminders(new Date().toISOString());
+    for (const card of due) {
+      const subs = store.getSubscriptions(card.userId);
+      if (subs.length) {
+        const payload = { title: '⏰ ' + card.title, body: card.dueAt ? 'Due ' + new Date(card.dueAt).toLocaleString('en-GB', { hour: '2-digit', minute: '2-digit', day: 'numeric', month: 'short' }) : 'Reminder', url: '/', tag: 'card-' + card.id };
+        await Promise.all(subs.map((s) => sendPush(s, payload)));
+      }
+      store.markReminded(card.id); // mark regardless, so we don't re-check a card with no live devices forever
+    }
+  } catch (err) { console.warn('  ▸ Reminder sweep error:', err.message); }
+  finally { sweeping = false; }
+}
+if (VAPID) setInterval(runReminderSweep, REMINDER_SWEEP_MS).unref();
 
 // ============================================================
 // BOOT
@@ -569,6 +790,7 @@ seedAdmin().then(() => {
     console.log(`\n  ▸ Today's Focus running   →  http://localhost:${PORT}`);
     console.log(`  ▸ Database                →  ${DB_FILE}`);
     console.log(`  ▸ Users / registration    →  ${store.countUsers()} user(s), registration: ${mode}`);
+    console.log(`  ▸ Push reminders          →  ${VAPID ? 'enabled' : 'disabled (no VAPID keys)'}`);
     console.log(s.needsBootstrap ? '  ▸ No users yet — the first account you create becomes the admin.\n' : '');
   });
 });
