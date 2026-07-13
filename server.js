@@ -725,6 +725,24 @@ app.get('/api/export', requireAuth, (req, res) => {
 // ============================================================
 // STATIC SPA
 // ============================================================
+// House bridge routes (definitions live in the HOUSE BRIDGE section below;
+// registered here so they sit above the API catch-all).
+app.get('/api/house/tasks', requireAuth, async (req, res) => {
+  if (!isHouseUser(req.user)) return res.status(404).json({ error: 'Not enabled for this account.' });
+  try { res.json({ tasks: await getHouseTasks('fresh' in req.query), baseUrl: HOUSEPLAN_PUBLIC_URL }); }
+  catch (e) { res.status(502).json({ error: 'House Plan unreachable — ' + e.message }); }
+});
+app.post('/api/house/tasks', requireAuth, async (req, res) => {
+  if (!isHouseUser(req.user)) return res.status(404).json({ error: 'Not enabled for this account.' });
+  try { const out = await houseFetch('/api/tasks', { method: 'POST', body: JSON.stringify(req.body || {}) }); houseCache.t = 0; res.status(201).json(out); }
+  catch (e) { res.status(502).json({ error: 'House Plan unreachable — ' + e.message }); }
+});
+app.post('/api/house/tasks/:id/toggle', requireAuth, async (req, res) => {
+  if (!isHouseUser(req.user)) return res.status(404).json({ error: 'Not enabled for this account.' });
+  try { const out = await houseFetch(`/api/tasks/${encodeURIComponent(req.params.id)}/toggle`, { method: 'POST' }); houseCache.t = 0; res.json(out); }
+  catch (e) { res.status(502).json({ error: 'House Plan unreachable — ' + e.message }); }
+});
+
 app.use('/api', (req, res) => res.status(404).json({ error: 'Unknown API endpoint.' }));
 app.use(express.static(PUBLIC_DIR));
 app.get('/privacy', (req, res) => res.sendFile(path.join(PUBLIC_DIR, 'privacy.html')));
@@ -757,6 +775,74 @@ async function runReminderSweep() {
   finally { sweeping = false; }
 }
 if (VAPID) setInterval(runReminderSweep, REMINDER_SWEEP_MS).unref();
+
+// ============================================================
+// HOUSE BRIDGE — mirrors House Plan jobs (houseplan.fatharr.space)
+// into a personal "🏠 House" view for one designated user.
+// House Plan stays the source of truth; nothing is stored here.
+// ============================================================
+const HOUSEPLAN_URL        = (process.env.HOUSEPLAN_URL || '').replace(/\/+$/, '');
+const HOUSEPLAN_PUBLIC_URL = (process.env.HOUSEPLAN_PUBLIC_URL || HOUSEPLAN_URL).replace(/\/+$/, '');
+const HOUSEPLAN_KEY        = process.env.HOUSEPLAN_BRIDGE_KEY || '';
+const HOUSE_USER           = (process.env.HOUSE_BOARD_USER || '').toLowerCase();
+const houseConfigured = () => !!(HOUSEPLAN_URL && HOUSEPLAN_KEY && HOUSE_USER);
+const isHouseUser = (u) => houseConfigured() && u && String(u.username).toLowerCase() === HOUSE_USER;
+
+let houseCache = { t: 0, tasks: null };
+async function houseFetch(path, options = {}) {
+  const res = await fetch(HOUSEPLAN_URL + path, {
+    ...options,
+    headers: { 'x-bridge-key': HOUSEPLAN_KEY, 'Content-Type': 'application/json', ...(options.headers || {}) },
+    signal: AbortSignal.timeout(6000),
+  });
+  if (!res.ok) throw new Error(`House Plan replied ${res.status}`);
+  return res.json();
+}
+async function getHouseTasks(fresh = false) {
+  if (!fresh && houseCache.tasks && Date.now() - houseCache.t < 30000) return houseCache.tasks;
+  const { tasks } = await houseFetch('/api/tasks');
+  houseCache = { t: Date.now(), tasks };
+  return tasks;
+}
+
+// Push when a repeating house job comes due (checked every 15 min).
+const HOUSE_SWEEP_MS = 15 * 60 * 1000;
+let houseSweeping = false;
+async function runHouseSweep() {
+  if (!VAPID || !houseConfigured() || houseSweeping) return;
+  houseSweeping = true;
+  try {
+    const user = store.getUserByUsername(HOUSE_USER);
+    if (!user) return;
+    const subs = store.getSubscriptions(user.id);
+    if (!subs.length) return;
+    const tasks = await getHouseTasks(true);
+    const due = tasks.filter((t) => t.state === 'open' && t.dueAt && new Date(t.dueAt) <= new Date());
+    let seen = {};
+    try { seen = JSON.parse(store.getAppSetting('house_notified') || '{}'); } catch (_) {}
+    const fresh = due.filter((t) => seen[t.id] !== t.dueAt);
+    if (fresh.length) {
+      for (const t of fresh) seen[t.id] = t.dueAt;
+      const live = new Set(tasks.map((t) => t.id));
+      for (const k of Object.keys(seen)) if (!live.has(k)) delete seen[k];
+      store.setAppSetting('house_notified', JSON.stringify(seen));
+      const body = fresh.length === 1
+        ? `${fresh[0].emoji} ${fresh[0].text}`.slice(0, 160)
+        : `${fresh.length} house jobs are due: ${fresh.map((t) => t.text).join(' · ')}`.slice(0, 160);
+      const payload = { title: '🏠 House job due', body, url: HOUSEPLAN_PUBLIC_URL || '/', tag: 'house-due' };
+      await Promise.all(subs.map((s) => sendPush(s, payload)));
+    }
+  } catch (err) { console.warn('  ▸ House sweep error:', err.message); }
+  finally { houseSweeping = false; }
+}
+if (VAPID) setInterval(runHouseSweep, HOUSE_SWEEP_MS).unref();
+if (houseConfigured()) {
+  setTimeout(() => {
+    getHouseTasks().then((t) => console.log(`  ▸ House bridge            →  connected — ${t.length} open job(s) for @${HOUSE_USER}`))
+      .catch((e) => console.warn(`  ▸ House bridge            →  UNREACHABLE (${e.message})`));
+    runHouseSweep();
+  }, 3000);
+}
 
 // ============================================================
 // BOOT

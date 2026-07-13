@@ -56,6 +56,8 @@ let activeFilter = null;                 // the filter object currently applied 
 let habits = [];                         // habit definitions
 let habitCheckins = new Set();           // "habitId|YYYY-MM-DD" for each completed day
 let focusViewOn = (() => { try { return localStorage.getItem('tf-focusview') !== '0'; } catch (_) { return true; } })(); // Focus Zone shown by default
+let houseData = null;                    // House Plan bridge tasks — null = bridge not enabled for this account
+let houseBase = '';                      // public House Plan URL for deep links
 let calCursor = null;                   // first-of-month Date shown in the Calendar view
 let journalDay = null;                   // YYYY-MM-DD open in the Journal
 let journalCursor = null;                // month shown in the Journal mini-calendar
@@ -155,10 +157,17 @@ async function enterApp() {
   await loadActive();
   await loadFilters();
   await loadHabits();
+  await loadHouse();
   renderQuickAdd();
   initPush();
   restoreView();
   startPolling();
+}
+async function loadHouse(fresh = false) {
+  try {
+    const { tasks, baseUrl } = await request('/house/tasks' + (fresh ? '?fresh' : ''));
+    houseData = tasks; houseBase = baseUrl || '';
+  } catch (_) { houseData = null; } // 404 = bridge not enabled for this account
 }
 function setAuthMode(mode) {
   authMode = mode;
@@ -1321,6 +1330,7 @@ function viewMeta() {
     case 'timeline': return { icon: '📊', title: 'Timeline' };
     case 'matrix': return { icon: '🔲', title: 'Priority Matrix' };
     case 'habits': return { icon: '🌱', title: 'Habits' };
+    case 'house': return { icon: '🏠', title: 'House' };
     case 'journal': return { icon: '📓', title: 'Journal' };
     case 'all': return { icon: '🗂️', title: 'All tasks' };
     case 'tag': return { icon: '#', title: activeTag || '' };
@@ -1421,13 +1431,116 @@ async function quickAdd(raw) {
     toast(p.dueAt ? `Added · due ${formatDue(p.dueAt)}` : 'Added ✓');
   } catch (err) { handleApiError(err); }
 }
+// ---- 🏠 House view (House Plan bridge — houseplan is the source of truth) ----
+const HOUSE_PRIO_HEX = { low: '#60a5fa', med: '#fbbf24', high: '#f87171' };
+function renderHouseView(root) {
+  $('#view-count').textContent = houseData && houseData.length ? String(houseData.filter((t) => t.state === 'open').length) : '';
+  const wrap = el('div', 'mx-auto w-full max-w-2xl');
+
+  const form = el('form', 'mb-4');
+  const input = el('input', 'field');
+  input.placeholder = '+ Add house job — try: fix gate latch @garage';
+  input.autocomplete = 'off';
+  form.append(input);
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const raw = input.value.trim(); if (!raw) return;
+    const m = raw.match(/@([\w\s''-]+)\s*$/);
+    const body = { text: (m ? raw.slice(0, m.index) : raw).trim(), room: m ? m[1].trim() : '' };
+    if (!body.text) return;
+    input.value = '';
+    try {
+      await request('/house/tasks', { method: 'POST', body: JSON.stringify(body) });
+      await loadHouse(true); renderCurrentView(); renderSidebar();
+      toast(body.room ? `Added to ${body.room} 🏠` : 'Added to the house list 🏠');
+    } catch (err) { handleApiError(err); }
+  });
+  wrap.append(form);
+
+  if (!houseData || !houseData.length) {
+    wrap.append(el('div', 'rounded-xl border border-edge bg-panel px-4 py-8 text-center text-sm text-ink-faint', 'Nothing on the house list. Add a job above, or pin one on the floor plan.'));
+  } else {
+    const open = houseData.filter((t) => t.state === 'open');
+    const later = houseData.filter((t) => t.state === 'later');
+    const groups = new Map();
+    open.forEach((t) => { const k = t.room || 'Elsewhere'; if (!groups.has(k)) groups.set(k, []); groups.get(k).push(t); });
+    groups.forEach((tasks, room) => {
+      const head = el('div', 'mb-1 mt-4 flex items-baseline justify-between');
+      head.append(el('h3', 'text-xs font-bold uppercase tracking-wide text-ink-faint', room), el('span', 'text-[11px] text-ink-faint', String(tasks.length)));
+      wrap.append(head);
+      const box = el('div', 'space-y-1');
+      tasks.forEach((t) => box.append(houseRow(t)));
+      wrap.append(box);
+    });
+    if (later.length) {
+      wrap.append(el('h3', 'mb-1 mt-6 text-xs font-bold uppercase tracking-wide text-ink-faint', '⏳ Scheduled'));
+      const box = el('div', 'space-y-1 opacity-70');
+      later.forEach((t) => box.append(houseRow(t)));
+      wrap.append(box);
+    }
+  }
+  if (houseBase) {
+    const a = el('a', 'mt-6 block text-center text-xs text-ink-faint underline decoration-dotted transition hover:text-ink', 'Open the floor plan ↗');
+    a.href = houseBase; a.target = '_blank'; a.rel = 'noopener';
+    wrap.append(a);
+  }
+  root.append(wrap);
+
+  // quiet background refresh so the view stays honest without hammering the bridge
+  if (!renderHouseView._busy && Date.now() - (renderHouseView._t || 0) > 15000) {
+    renderHouseView._busy = true;
+    loadHouse(true)
+      .then(() => { renderHouseView._t = Date.now(); renderHouseView._busy = false; if (currentView.kind === 'house') { renderListView(); renderSidebar(); } })
+      .catch(() => { renderHouseView._busy = false; });
+  }
+}
+function houseRow(t) {
+  const row = el('div', 'flex items-center gap-3 rounded-xl border border-edge bg-panel px-3 py-2');
+  const cb = el('button', 'grid h-5 w-5 shrink-0 place-items-center rounded-full border-2 text-[10px]');
+  cb.style.borderColor = HOUSE_PRIO_HEX[t.priority] || '#888';
+  cb.title = t.state === 'later' ? 'Make due now' : (t.repeat ? 'Done — schedules the next one' : 'Mark done');
+  cb.textContent = t.state === 'later' ? '⏳' : '';
+  cb.addEventListener('click', async () => {
+    try { await request(`/house/tasks/${t.id}/toggle`, { method: 'POST' }); await loadHouse(true); renderCurrentView(); renderSidebar(); }
+    catch (err) { handleApiError(err); }
+  });
+  const main = el('div', 'min-w-0 flex-1');
+  main.append(el('div', 'truncate text-sm text-ink', `${t.emoji} ${t.text}`));
+  const meta = [];
+  if (t.room && t.floor) meta.push(t.floor);
+  if (t.cost != null) meta.push('£' + t.cost);
+  if (t.repeat) meta.push('↻ ' + t.repeat);
+  if (t.state === 'later' && t.dueAt) meta.push('due ' + formatDue(t.dueAt));
+  if (t.photos) meta.push('📷 ' + t.photos);
+  if (meta.length) main.append(el('div', 'truncate text-[11px] text-ink-faint', meta.join(' · ')));
+  row.append(cb, main);
+  if (houseBase) {
+    const open = el('a', 'shrink-0 rounded p-1 text-base text-ink-faint transition hover:text-ink', '🗺️');
+    open.title = 'Show on the floor plan';
+    open.href = houseBase + t.path; open.target = '_blank'; open.rel = 'noopener';
+    row.append(open);
+  }
+  return row;
+}
+function houseTodaySection() {
+  if (!houseData) return null;
+  const due = houseData.filter((t) => t.state === 'open' && t.dueAt && dayStart(new Date(t.dueAt)) <= todayStart());
+  if (!due.length) return null;
+  const box = el('div', 'mt-6');
+  box.append(el('h3', 'mb-1 text-xs font-bold uppercase tracking-wide text-ink-faint', '🏠 House — due'));
+  const list = el('div', 'space-y-1');
+  due.forEach((t) => list.append(houseRow(t)));
+  box.append(list);
+  return box;
+}
+
 function renderSmartViews() {
   const nav = $('#smart-views'); if (!nav) return; nav.innerHTML = '';
   const end = todayStart(); end.setDate(end.getDate() + 7);
   const todayN = allCards.filter((c) => c.dueAt && dayStart(new Date(c.dueAt)) <= todayStart()).length;
   const upN = allCards.filter((c) => c.dueAt && dayStart(new Date(c.dueAt)) <= end).length;
   const focusN = boards.reduce((n, bd) => n + (boardFocus(bd) ? 1 : 0), 0);
-  [
+  const items = [
     { kind: 'focuses', icon: '🎯', label: 'In Focus', count: focusN },
     { kind: 'today', icon: '📅', label: 'Today', count: todayN },
     { kind: 'upcoming', icon: '🗓️', label: 'Next 7 days', count: upN },
@@ -1437,7 +1550,9 @@ function renderSmartViews() {
     { kind: 'habits', icon: '🌱', label: 'Habits' },
     { kind: 'journal', icon: '📓', label: 'Journal' },
     { kind: 'all', icon: '🗂️', label: 'All tasks', count: allCards.length },
-  ].forEach((it) => {
+  ];
+  if (houseData) items.splice(3, 0, { kind: 'house', icon: '🏠', label: 'House', count: houseData.filter((t) => t.state === 'open').length });
+  items.forEach((it) => {
     const b = el('button', 'nav-item' + (currentView.kind === it.kind ? ' active' : ''));
     b.append(el('span', 'text-base leading-none', it.icon), el('span', 'flex-1 truncate', it.label));
     if (it.count) b.append(el('span', 'nav-count', String(it.count)));
@@ -1516,12 +1631,18 @@ function renderListView() {
   if (currentView.kind === 'journal') { $('#view-count').textContent = ''; renderJournal(root); return; }
   if (currentView.kind === 'matrix') { renderMatrix(root); return; }
   if (currentView.kind === 'habits') { renderHabits(root); return; }
+  if (currentView.kind === 'house') { renderHouseView(root); return; }
   if (currentView.kind === 'focuses') { renderFocusesView(root); return; }
   const list = viewCards();
   $('#view-count').textContent = list.length ? String(list.length) : '';
   const isDateView = currentView.kind === 'today' || currentView.kind === 'upcoming';
   const wrap = el('div', 'mx-auto w-full ' + (isDateView ? 'max-w-2xl' : 'max-w-6xl'));
-  if (!list.length) { root.append(listEmptyState()); return; }
+  if (!list.length) {
+    const hs = currentView.kind === 'today' ? houseTodaySection() : null;
+    if (hs) { const w = el('div', 'mx-auto w-full max-w-2xl'); w.append(hs); root.append(w); }
+    else root.append(listEmptyState());
+    return;
+  }
   const bar = el('div', 'mb-3 flex items-center justify-end gap-2');
   bar.append(el('span', 'text-xs text-ink-faint', 'Sort'));
   const sortSel = el('select', 'rounded-lg border border-edge bg-panel px-2 py-1 text-xs text-ink-soft');
@@ -1546,6 +1667,7 @@ function renderListView() {
       wrap.append(head);
       const g = el('div', 'space-y-1.5'); cards.forEach((c) => g.append(taskRow(c))); wrap.append(g);
     });
+    if (currentView.kind === 'today') { const hs = houseTodaySection(); if (hs) wrap.append(hs); }
   } else {
     const cols = el('div', 'columns-1 lg:columns-2 2xl:columns-3'); cols.style.columnGap = '1.25rem';
     groups.forEach((cards, label) => {
