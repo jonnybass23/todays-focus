@@ -1323,6 +1323,7 @@ function applyViewLayout() {
 }
 function viewMeta() {
   switch (currentView.kind) {
+    case 'overview': return { icon: '🗺️', title: 'Overview' };
     case 'focuses': return { icon: '🎯', title: 'In Focus' };
     case 'today': return { icon: '📅', title: 'Today' };
     case 'upcoming': return { icon: '🗓️', title: 'Next 7 days' };
@@ -1541,6 +1542,7 @@ function renderSmartViews() {
   const upN = allCards.filter((c) => c.dueAt && dayStart(new Date(c.dueAt)) <= end).length;
   const focusN = boards.reduce((n, bd) => n + (boardFocus(bd) ? 1 : 0), 0);
   const items = [
+    { kind: 'overview', icon: '🗺️', label: 'Overview' },
     { kind: 'focuses', icon: '🎯', label: 'In Focus', count: focusN },
     { kind: 'today', icon: '📅', label: 'Today', count: todayN },
     { kind: 'upcoming', icon: '🗓️', label: 'Next 7 days', count: upN },
@@ -1630,6 +1632,7 @@ function renderListView() {
   if (currentView.kind === 'timeline') { renderTimeline(root); return; }
   if (currentView.kind === 'journal') { $('#view-count').textContent = ''; renderJournal(root); return; }
   if (currentView.kind === 'matrix') { renderMatrix(root); return; }
+  if (currentView.kind === 'overview') { renderOverview(root); return; }
   if (currentView.kind === 'habits') { renderHabits(root); return; }
   if (currentView.kind === 'house') { renderHouseView(root); return; }
   if (currentView.kind === 'focuses') { renderFocusesView(root); return; }
@@ -1843,6 +1846,76 @@ function renderMatrix(root) {
     box.append(head, body); grid.append(box);
   });
   root.append(grid);
+}
+
+// ---- Overview (houseplan-style: every project as a box, all on one page) ----
+function boardHue(id) { let h = 0; for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0; return h % 360; }
+function overviewSort(a, b) { return ((b.priority || 0) - (a.priority || 0)) || (dueSortKey(a) - dueSortKey(b)) || (a.createdAt < b.createdAt ? -1 : 1); }
+async function overviewMove(id, boardId) {
+  const card = allCards.find((c) => c.id === id); if (!card || card.boardId === boardId) return;
+  card.boardId = boardId; renderOverview($('#list-view')); // optimistic
+  try { await request('/cards/' + id + '/move', { method: 'POST', body: JSON.stringify({ boardId }) }); await loadActive(); renderOverview($('#list-view')); renderSidebar(); }
+  catch (err) { if (!handleApiError(err)) { await loadActive(); renderOverview($('#list-view')); } }
+}
+function overviewTask(c) {
+  const row = el('article', 'group flex items-center gap-2 rounded-lg border border-edge bg-card px-2.5 py-1.5 text-sm text-ink transition hover:border-edge-strong cursor-grab active:cursor-grabbing');
+  row.draggable = true; row.dataset.cardId = c.id;
+  if (c.priority) { row.style.borderLeftColor = PRIORITY_HEX[c.priority]; row.style.borderLeftWidth = '3px'; }
+  const box = el('button', 'grid h-4 w-4 shrink-0 place-items-center rounded-full border-2 text-transparent transition hover:text-ink-soft');
+  box.style.borderColor = priorityColor(c.priority) || 'var(--ink-faint)'; box.title = 'Complete'; box.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" class="h-2.5 w-2.5"><path d="M20 6 9 17l-5-5"/></svg>';
+  guardDrag(box, row); box.addEventListener('click', (e) => { e.stopPropagation(); completeCard(c.id); });
+  const mid = el('div', 'min-w-0 flex-1'); mid.append(el('div', 'truncate', c.title));
+  const meta = el('div', 'mt-0.5 flex flex-wrap items-center gap-1');
+  if (c.dueAt) { const p = el('span', 'due-pill ' + dueClass(c.dueAt)); p.innerHTML = CLOCK_SVG; p.append(el('span', '', formatDue(c.dueAt))); meta.append(p); }
+  (c.tags || []).slice(0, 3).forEach((t) => meta.append(el('span', 'tag-chip', '#' + t)));
+  if (meta.childNodes.length) mid.append(meta);
+  row.append(box, mid);
+  row.addEventListener('click', () => openTaskModal(c));
+  row.addEventListener('contextmenu', (e) => { e.preventDefault(); openCardMenu(c, row, { multiBoard: boards.length > 1, x: e.clientX, y: e.clientY }); });
+  return row;
+}
+function openOverviewAdd(bd, body, addBtn) {
+  if (body.querySelector('.ov-add-input')) return;
+  const inp = el('input', 'ov-add-input w-full rounded-lg border border-edge bg-inputbg px-2.5 py-1.5 text-sm text-ink outline-none focus:border-edge-strong');
+  inp.placeholder = 'New task… (e.g. Call Sam tomorrow #home !!)';
+  inp.addEventListener('keydown', async (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault(); const v = inp.value.trim(); if (!v) { inp.remove(); return; }
+      const p = parseQuickAdd(v); const payload = { title: p.title || v, boardId: bd.id, tags: p.tags, priority: p.priority, recur: p.recur };
+      if (p.dueAt) { payload.dueAt = p.dueAt; if (hasTimeOf(p.dueAt)) payload.remindAt = p.dueAt; }
+      try { await request('/cards', { method: 'POST', body: JSON.stringify(payload) }); await loadActive(); renderOverview($('#list-view')); renderSidebar(); } catch (err) { handleApiError(err); }
+    } else if (e.key === 'Escape') { inp.remove(); }
+  });
+  inp.addEventListener('blur', () => { if (!inp.value.trim()) inp.remove(); });
+  body.append(inp); inp.focus();
+}
+function renderOverview(root) {
+  root.innerHTML = '';
+  $('#view-count').textContent = boards.length ? String(boards.length) : '';
+  const wrap = el('div', 'mx-auto w-full max-w-[1800px]');
+  const cols = el('div', 'columns-1 sm:columns-2 xl:columns-3 2xl:columns-4'); cols.style.columnGap = '1rem';
+  boards.forEach((bd) => {
+    const cards = allCards.filter((c) => c.boardId === bd.id).sort(overviewSort);
+    const boxEl = el('div', 'mb-4 break-inside-avoid overflow-hidden rounded-2xl border border-edge bg-panel');
+    boxEl.style.borderTopColor = `hsl(${boardHue(bd.id)} 60% 55%)`; boxEl.style.borderTopWidth = '3px';
+    const head = el('div', 'flex items-center gap-2 border-b border-edge px-3 py-2.5');
+    head.append(el('span', 'text-lg leading-none', bd.icon), el('span', 'flex-1 truncate text-sm font-semibold text-ink', bd.name));
+    if (cards.length) head.append(el('span', 'text-xs tabular-nums text-ink-faint', String(cards.length)));
+    const openBtn = el('button', 'grid h-6 w-6 place-items-center rounded-md text-ink-faint transition hover:bg-edge hover:text-ink', '↗'); openBtn.title = 'Open this board'; openBtn.addEventListener('click', () => openBoard(bd.id));
+    head.append(openBtn); boxEl.append(head);
+    const body = el('div', 'clean-scroll max-h-[60vh] space-y-1.5 overflow-y-auto p-2'); body.dataset.ovBoard = bd.id;
+    body.addEventListener('dragover', (e) => { if (!ui.draggingId) return; e.preventDefault(); e.dataTransfer.dropEffect = 'move'; body.classList.add('drag-over'); });
+    body.addEventListener('dragleave', (e) => { if (!body.contains(e.relatedTarget)) body.classList.remove('drag-over'); });
+    body.addEventListener('drop', (e) => { e.preventDefault(); body.classList.remove('drag-over'); const id = e.dataTransfer.getData('text/plain') || ui.draggingId; if (id) overviewMove(id, bd.id); });
+    if (!cards.length) body.append(el('p', 'select-none px-1 py-4 text-center text-xs text-ink-faint', 'Empty — drop a task here'));
+    else cards.forEach((c) => body.append(overviewTask(c)));
+    boxEl.append(body);
+    const add = el('button', 'flex w-full items-center gap-1 border-t border-edge px-3 py-2 text-xs text-ink-faint transition hover:text-ink', '＋ Add task');
+    add.addEventListener('click', () => openOverviewAdd(bd, body, add));
+    boxEl.append(add);
+    cols.append(boxEl);
+  });
+  wrap.append(cols); root.append(wrap);
 }
 
 // ---- Timeline (Gantt-style: bars from start → due, grouped by project) ----
@@ -2323,7 +2396,7 @@ async function poll() {
       if (JSON.stringify(cards) !== JSON.stringify(state.cards)) { state.cards = cards; render(); }
     }
     const { cards: ac } = await request('/active');
-    if (JSON.stringify(ac) !== JSON.stringify(allCards)) { allCards = ac; renderSidebar(); if (!['board', 'journal', 'habits', 'timeline'].includes(currentView.kind)) renderListView(); }
+    if (JSON.stringify(ac) !== JSON.stringify(allCards)) { allCards = ac; renderSidebar(); if (!['board', 'journal', 'habits', 'timeline', 'overview'].includes(currentView.kind)) renderListView(); }
   } catch (err) { if (err.status === 401) forceReauth(); }
 }
 
