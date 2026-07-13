@@ -168,6 +168,12 @@ async function loadHouse(fresh = false) {
     const { tasks, baseUrl } = await request('/house/tasks' + (fresh ? '?fresh' : ''));
     houseData = tasks; houseBase = baseUrl || '';
   } catch (_) { houseData = null; } // 404 = bridge not enabled for this account
+  const hl = $('#house-link');
+  if (hl) {
+    if (houseBase) hl.href = houseBase;
+    hl.classList.toggle('hidden', !houseData);
+    hl.classList.toggle('flex', !!houseData);
+  }
 }
 function setAuthMode(mode) {
   authMode = mode;
